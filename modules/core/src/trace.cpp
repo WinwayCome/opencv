@@ -506,71 +506,71 @@ Region::Region(const LocationStaticStorage& location) :
     ctx.stackPush(this, &location, beginTimestamp);
     implFlags |= REGION_FLAG__NEED_STACK_POP;
 
-    if ((location.flags & REGION_FLAG_REGION_FORCE) == 0)
-    {
-        if (ctx.stat_status._skipDepth >= 0 && currentDepth > ctx.stat_status._skipDepth)
-        {
-            CV_LOG(_spaces(ctx.getCurrentDepth()*4) << "Parent region is disabled. Bailout");
-            ctx.stat.currentSkippedRegions++;
-            return;
-        }
+    // if ((location.flags & REGION_FLAG_REGION_FORCE) == 0)
+    // {
+    //     if (ctx.stat_status._skipDepth >= 0 && currentDepth > ctx.stat_status._skipDepth)
+    //     {
+    //         CV_LOG(_spaces(ctx.getCurrentDepth()*4) << "Parent region is disabled. Bailout");
+    //         ctx.stat.currentSkippedRegions++;
+    //         return;
+    //     }
 
-        if (param_maxRegionChildrenOpenCV > 0 && (location.flags & REGION_FLAG_APP_CODE) == 0 && parentLocation && (parentLocation->flags & REGION_FLAG_APP_CODE) == 0)
-        {
-            if (parentChildren >= param_maxRegionChildrenOpenCV)
-            {
-                CV_LOG_TRACE_BAILOUT(NULL, _spaces(ctx.getCurrentDepth()*4) << "OpenCV parent region exceeds children count. Bailout");
-                ctx.stat_status.enableSkipMode(currentDepth - 1);
-                ctx.stat.currentSkippedRegions++;
-                DEBUG_ONLY(ctx.dumpStack(std::cout, false));
-                return;
-            }
-        }
-        if (param_maxRegionChildren > 0 && parentChildren >= param_maxRegionChildren)
-        {
-            CV_LOG_TRACE_BAILOUT(NULL, _spaces(ctx.getCurrentDepth()*4) << "Parent region exceeds children count. Bailout");
-            ctx.stat_status.enableSkipMode(currentDepth - 1);
-            ctx.stat.currentSkippedRegions++;
-            DEBUG_ONLY(ctx.dumpStack(std::cout, false));
-            return;
-        }
-    }
+    //     if (param_maxRegionChildrenOpenCV > 0 && (location.flags & REGION_FLAG_APP_CODE) == 0 && parentLocation && (parentLocation->flags & REGION_FLAG_APP_CODE) == 0)
+    //     {
+    //         if (parentChildren >= param_maxRegionChildrenOpenCV)
+    //         {
+    //             CV_LOG_TRACE_BAILOUT(NULL, _spaces(ctx.getCurrentDepth()*4) << "OpenCV parent region exceeds children count. Bailout");
+    //             ctx.stat_status.enableSkipMode(currentDepth - 1);
+    //             ctx.stat.currentSkippedRegions++;
+    //             DEBUG_ONLY(ctx.dumpStack(std::cout, false));
+    //             return;
+    //         }
+    //     }
+    //     if (param_maxRegionChildren > 0 && parentChildren >= param_maxRegionChildren)
+    //     {
+    //         CV_LOG_TRACE_BAILOUT(NULL, _spaces(ctx.getCurrentDepth()*4) << "Parent region exceeds children count. Bailout");
+    //         ctx.stat_status.enableSkipMode(currentDepth - 1);
+    //         ctx.stat.currentSkippedRegions++;
+    //         DEBUG_ONLY(ctx.dumpStack(std::cout, false));
+    //         return;
+    //     }
+    // }
 
     LocationExtraData::init(location);
 
-    if ((*location.ppExtra)->global_location_id == 0)
-    {
-        CV_LOG_TRACE_BAILOUT(NULL, _spaces(ctx.getCurrentDepth()*4) << "Region location is disabled. Bailout");
-        ctx.stat_status.enableSkipMode(currentDepth);
-        ctx.stat.currentSkippedRegions++;
-        return;
-    }
+    // if ((*location.ppExtra)->global_location_id == 0)
+    // {
+    //     CV_LOG_TRACE_BAILOUT(NULL, _spaces(ctx.getCurrentDepth()*4) << "Region location is disabled. Bailout");
+    //     ctx.stat_status.enableSkipMode(currentDepth);
+    //     ctx.stat.currentSkippedRegions++;
+    //     return;
+    // }
 
-    if (parentLocation && (parentLocation->flags & REGION_FLAG_SKIP_NESTED))
-    {
-        CV_LOG(_spaces(ctx.getCurrentDepth()*4) << "Parent region disables inner regions. Bailout");
-        ctx.stat_status.enableSkipMode(currentDepth);
-        ctx.stat.currentSkippedRegions++;
-        return;
-    }
+    // if (parentLocation && (parentLocation->flags & REGION_FLAG_SKIP_NESTED))
+    // {
+    //     CV_LOG(_spaces(ctx.getCurrentDepth()*4) << "Parent region disables inner regions. Bailout");
+    //     ctx.stat_status.enableSkipMode(currentDepth);
+    //     ctx.stat.currentSkippedRegions++;
+    //     return;
+    // }
 
-    if (param_maxRegionDepthOpenCV)
-    {
-        if ((location.flags & REGION_FLAG_APP_CODE) == 0)
-        {
-            if (ctx.regionDepthOpenCV >= param_maxRegionDepthOpenCV)
-            {
-                CV_LOG(_spaces(ctx.getCurrentDepth()*4) << "OpenCV region depth is exceed = " << ctx.regionDepthOpenCV << ". Bailout");
-                if (ctx.stat.currentSkippedRegions == 0)
-                {
-                    DEBUG_ONLY(ctx.dumpStack(std::cout, false));
-                }
-                ctx.stat_status.enableSkipMode(currentDepth);
-                ctx.stat.currentSkippedRegions++;
-                return;
-            }
-        }
-    }
+    // if (param_maxRegionDepthOpenCV)
+    // {
+    //     if ((location.flags & REGION_FLAG_APP_CODE) == 0)
+    //     {
+    //         if (ctx.regionDepthOpenCV >= param_maxRegionDepthOpenCV)
+    //         {
+    //             CV_LOG(_spaces(ctx.getCurrentDepth()*4) << "OpenCV region depth is exceed = " << ctx.regionDepthOpenCV << ". Bailout");
+    //             if (ctx.stat.currentSkippedRegions == 0)
+    //             {
+    //                 DEBUG_ONLY(ctx.dumpStack(std::cout, false));
+    //             }
+    //             ctx.stat_status.enableSkipMode(currentDepth);
+    //             ctx.stat.currentSkippedRegions++;
+    //             return;
+    //         }
+    //     }
+    // }
 
     new Impl(ctx, parentRegion, *this, location, beginTimestamp);
     CV_DbgAssert(pImpl != NULL);
