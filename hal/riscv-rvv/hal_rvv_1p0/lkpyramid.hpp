@@ -44,7 +44,7 @@ namespace cv
                                    short *dst_data, size_t dst_step,
                                    int width, int height, int cn)
             {
-                return CV_HAL_ERROR_OK;
+                return CV_HAL_ERROR_NOT_IMPLEMENTED;
             }
 
             inline int lkOpticalFlowLevel(
@@ -59,7 +59,7 @@ namespace cv
                 bool get_min_eigen_vals,
                 float min_eigen_vals_threshold)
             {
-                return CV_HAL_ERROR_OK;
+                return CV_HAL_ERROR_NOT_IMPLEMENTED;
             }
 
         }

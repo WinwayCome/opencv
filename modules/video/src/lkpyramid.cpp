@@ -48,54 +48,78 @@
 #ifdef HAVE_OPENCV_CALIB3D
 #include "opencv2/calib3d.hpp"
 #endif
-
+#ifndef CV_DISABLE_LK_PARALLEL
+#define CV_DISABLE_LK_PARALLEL false
+#endif
+#if
 #include "opencv2/core/openvx/ovx_defs.hpp"
 #include "hal_replacement.hpp"
 
-#define  CV_DESCALE(x,n)     (((x) + (1 << ((n)-1))) >> (n))
+#define CV_DESCALE(x, n) (((x) + (1 << ((n) - 1))) >> (n))
 
 namespace
 {
-static void calcScharrDeriv(const cv::Mat& src, cv::Mat& dst)
+    static void calcScharrDeriv(const cv::Mat &src, cv::Mat &dst)
+    {
+        using namespace cv;
+        using cv::detail::deriv_type;
+        int rows = src.rows, cols = src.cols, cn = src.channels(), depth = src.depth();
+        CV_Assert(depth == CV_8U);
+        dst.create(rows, cols, CV_MAKETYPE(DataType<deriv_type>::depth, cn * 2));
+
+        // CALL_HAL(ScharrDeriv, cv_hal_ScharrDeriv, src.data, src.step, (short*)dst.data, dst.step, cols, rows, cn);
+
+        parallel_for_(Range(0, rows), cv::detail::ScharrDerivInvoker(src, dst), CV_DISABLE_LK_PARALLEL ? 1 : cv::getNumThreads());
+    }
+
+} // namespace
+
+void cv::detail::ScharrDerivInvoker::operator()(const Range &range) const
 {
-    using namespace cv;
+    CV_TRACE_FUNCTION();
     using cv::detail::deriv_type;
-    int rows = src.rows, cols = src.cols, cn = src.channels(), depth = src.depth();
-    CV_Assert(depth == CV_8U);
-    dst.create(rows, cols, CV_MAKETYPE(DataType<deriv_type>::depth, cn*2));
+    int rows = src.rows, cols = src.cols, cn = src.channels(), colsn = cols * cn;
 
-    CALL_HAL(ScharrDeriv, cv_hal_ScharrDeriv, src.data, src.step, (short*)dst.data, dst.step, cols, rows, cn);
+    const int y0 = range.start;
+    const int y1 = range.end;
+    const int blkH = y1 - y0;
 
-    parallel_for_(Range(0, rows), cv::detail::ScharrDerivInvoker(src, dst), cv::getNumThreads());
-}
+    // RVV ADD
+    const int haloTop = (y0 > 0) ? 1 : 0;
+    const int haloBottom = (y1 < rows) ? 1 : 0;
+    const int callRows = blkH + haloTop + haloBottom;
 
-}//namespace
+    const uchar *srcBlock = src.ptr<uchar>(y0 - haloTop);
+    short *dstBlock = const_cast<short *>(dst.ptr<short>(y0 - haloTop));
 
-void cv::detail::ScharrDerivInvoker::operator()(const Range& range) const
-{
-    using cv::detail::deriv_type;
-    int rows = src.rows, cols = src.cols, cn = src.channels(), colsn = cols*cn;
+    CALL_HAL(ScharrDeriv, cv_hal_ScharrDeriv,
+             srcBlock, src.step,
+             dstBlock, dst.step,
+             cols, callRows, cn);
+    // END RVV ADD
 
-    int x, y, delta = (int)alignSize((cols + 2)*cn, 16);
-    AutoBuffer<deriv_type> _tempBuf(delta*2 + 64);
+    int x, y, delta = (int)alignSize((cols + 2) * cn, 16);
+    AutoBuffer<deriv_type> _tempBuf(delta * 2 + 64);
     deriv_type *trow0 = alignPtr(_tempBuf.data() + cn, 16), *trow1 = alignPtr(trow0 + delta, 16);
 
 #if CV_SIMD128
     v_int16x8 c3 = v_setall_s16(3), c10 = v_setall_s16(10);
 #endif
 
-    for( y = range.start; y < range.end; y++ )
+    for (y = range.start; y < range.end; y++)
     {
-        const uchar* srow0 = src.ptr<uchar>(y > 0 ? y-1 : rows > 1 ? 1 : 0);
-        const uchar* srow1 = src.ptr<uchar>(y);
-        const uchar* srow2 = src.ptr<uchar>(y < rows-1 ? y+1 : rows > 1 ? rows-2 : 0);
-        deriv_type* drow = (deriv_type *)dst.ptr<deriv_type>(y);
+        const uchar *srow0 = src.ptr<uchar>(y > 0 ? y - 1 : rows > 1 ? 1
+                                                                     : 0);
+        const uchar *srow1 = src.ptr<uchar>(y);
+        const uchar *srow2 = src.ptr<uchar>(y < rows - 1 ? y + 1 : rows > 1 ? rows - 2
+                                                                            : 0);
+        deriv_type *drow = (deriv_type *)dst.ptr<deriv_type>(y);
 
         // do vertical convolution
         x = 0;
 #if CV_SIMD128
         {
-            for( ; x <= colsn - 8; x += 8 )
+            for (; x <= colsn - 8; x += 8)
             {
                 v_int16x8 s0 = v_reinterpret_as_s16(v_load_expand(srow0 + x));
                 v_int16x8 s1 = v_reinterpret_as_s16(v_load_expand(srow1 + x));
@@ -110,27 +134,29 @@ void cv::detail::ScharrDerivInvoker::operator()(const Range& range) const
         }
 #endif
 
-        for( ; x < colsn; x++ )
+        for (; x < colsn; x++)
         {
-            int t0 = (srow0[x] + srow2[x])*3 + srow1[x]*10;
+            int t0 = (srow0[x] + srow2[x]) * 3 + srow1[x] * 10;
             int t1 = srow2[x] - srow0[x];
             trow0[x] = (deriv_type)t0;
             trow1[x] = (deriv_type)t1;
         }
 
         // make border
-        int x0 = (cols > 1 ? 1 : 0)*cn, x1 = (cols > 1 ? cols-2 : 0)*cn;
-        for( int k = 0; k < cn; k++ )
+        int x0 = (cols > 1 ? 1 : 0) * cn, x1 = (cols > 1 ? cols - 2 : 0) * cn;
+        for (int k = 0; k < cn; k++)
         {
-            trow0[-cn + k] = trow0[x0 + k]; trow0[colsn + k] = trow0[x1 + k];
-            trow1[-cn + k] = trow1[x0 + k]; trow1[colsn + k] = trow1[x1 + k];
+            trow0[-cn + k] = trow0[x0 + k];
+            trow0[colsn + k] = trow0[x1 + k];
+            trow1[-cn + k] = trow1[x0 + k];
+            trow1[colsn + k] = trow1[x1 + k];
         }
 
         // do horizontal convolution, interleave the results and store them to dst
         x = 0;
 #if CV_SIMD128
         {
-            for( ; x <= colsn - 8; x += 8 )
+            for (; x <= colsn - 8; x += 8)
             {
                 v_int16x8 s0 = v_load(trow0 + x - cn);
                 v_int16x8 s1 = v_load(trow0 + x + cn);
@@ -141,25 +167,26 @@ void cv::detail::ScharrDerivInvoker::operator()(const Range& range) const
                 v_int16x8 t0 = v_sub(s1, s0);
                 v_int16x8 t1 = v_add(v_mul_wrap(v_add(s2, s4), c3), v_mul_wrap(s3, c10));
 
-                v_store_interleave((drow + x*2), t0, t1);
+                v_store_interleave((drow + x * 2), t0, t1);
             }
         }
 #endif
-        for( ; x < colsn; x++ )
+        for (; x < colsn; x++)
         {
-            deriv_type t0 = (deriv_type)(trow0[x+cn] - trow0[x-cn]);
-            deriv_type t1 = (deriv_type)((trow1[x+cn] + trow1[x-cn])*3 + trow1[x]*10);
-            drow[x*2] = t0; drow[x*2+1] = t1;
+            deriv_type t0 = (deriv_type)(trow0[x + cn] - trow0[x - cn]);
+            deriv_type t1 = (deriv_type)((trow1[x + cn] + trow1[x - cn]) * 3 + trow1[x] * 10);
+            drow[x * 2] = t0;
+            drow[x * 2 + 1] = t1;
         }
     }
 }
 
 cv::detail::LKTrackerInvoker::LKTrackerInvoker(
-                      const Mat& _prevImg, const Mat& _prevDeriv, const Mat& _nextImg,
-                      const Point2f* _prevPts, Point2f* _nextPts,
-                      uchar* _status, float* _err,
-                      Size _winSize, TermCriteria _criteria,
-                      int _level, int _maxLevel, int _flags, float _minEigThreshold )
+    const Mat &_prevImg, const Mat &_prevDeriv, const Mat &_nextImg,
+    const Point2f *_prevPts, Point2f *_nextPts,
+    uchar *_status, float *_err,
+    Size _winSize, TermCriteria _criteria,
+    int _level, int _maxLevel, int _flags, float _minEigThreshold)
 {
     prevImg = &_prevImg;
     prevDeriv = &_prevDeriv;
@@ -184,71 +211,70 @@ typedef float acctype;
 typedef float itemtype;
 #endif
 
-void cv::detail::LKTrackerInvoker::operator()(const Range& range) const
+void cv::detail::LKTrackerInvoker::operator()(const Range &range) const
 {
-    CV_INSTRUMENT_REGION();
+    CV_TRACE_FUNCTION();
 
     const int W_BITS = 14, W_BITS1 = 14;
-    const float FLT_SCALE = 1.f/(1 << 20);
+    const float FLT_SCALE = 1.f / (1 << 20);
 
-    Point2f halfWin((winSize.width-1)*0.5f, (winSize.height-1)*0.5f);
-    const Mat& I = *prevImg;
-    const Mat& J = *nextImg;
-    const Mat& derivI = *prevDeriv;
+    Point2f halfWin((winSize.width - 1) * 0.5f, (winSize.height - 1) * 0.5f);
+    const Mat &I = *prevImg;
+    const Mat &J = *nextImg;
+    const Mat &derivI = *prevDeriv;
 
     cv::AutoBuffer<Point2f> prevPtsScaledData(range.end - range.start);
-    Point2f* prevPtsScaled = prevPtsScaledData.data();
+    Point2f *prevPtsScaled = prevPtsScaledData.data();
 
-    int j, cn = I.channels(), cn2 = cn*2;
-    cv::AutoBuffer<deriv_type> _buf(winSize.area()*(cn + cn2));
+    int j, cn = I.channels(), cn2 = cn * 2;
+    cv::AutoBuffer<deriv_type> _buf(winSize.area() * (cn + cn2));
     int derivDepth = DataType<deriv_type>::depth;
 
     Mat IWinBuf(winSize, CV_MAKETYPE(derivDepth, cn), _buf.data());
-    Mat derivIWinBuf(winSize, CV_MAKETYPE(derivDepth, cn2), _buf.data() + winSize.area()*cn);
+    Mat derivIWinBuf(winSize, CV_MAKETYPE(derivDepth, cn2), _buf.data() + winSize.area() * cn);
 
-    for( int ptidx = range.start; ptidx < range.end; ptidx++ )
+    for (int ptidx = range.start; ptidx < range.end; ptidx++)
     {
-        Point2f prevPt = prevPts[ptidx]*(float)(1./(1 << level));
+        Point2f prevPt = prevPts[ptidx] * (float)(1. / (1 << level));
         Point2f nextPt;
-        if( level == maxLevel )
+        if (level == maxLevel)
         {
-            if( flags & OPTFLOW_USE_INITIAL_FLOW )
-                nextPt = nextPts[ptidx]*(float)(1./(1 << level));
+            if (flags & OPTFLOW_USE_INITIAL_FLOW)
+                nextPt = nextPts[ptidx] * (float)(1. / (1 << level));
             else
                 nextPt = prevPt;
         }
         else
-            nextPt = nextPts[ptidx]*2.f;
+            nextPt = nextPts[ptidx] * 2.f;
         nextPts[ptidx] = nextPt;
-        prevPtsScaled[ptidx-range.start] = prevPt;
+        prevPtsScaled[ptidx - range.start] = prevPt;
     }
 
     CALL_HAL(LKOpticalFlowLevel, cv_hal_LKOpticalFlowLevel,
-        I.data, I.step, (const short*)derivI.data, derivI.step, J.data, J.step,
-        I.cols, I.rows, I.channels(),
-        (float*)prevPtsScaled, (float*)(nextPts+range.start), range.end-range.start,
-        (level == 0) ? status+range.start: nullptr,
-        err != nullptr ? err+range.start: nullptr,
-        winSize.width, winSize.height, criteria.maxCount, criteria.epsilon,
-        (flags & OPTFLOW_LK_GET_MIN_EIGENVALS) != 0,
-        (float)minEigThreshold
-    );
+             I.data, I.step, (const short *)derivI.data, derivI.step, J.data, J.step,
+             I.cols, I.rows, I.channels(),
+             (float *)prevPtsScaled, (float *)(nextPts + range.start), range.end - range.start,
+             (level == 0) ? status + range.start : nullptr,
+             err != nullptr ? err + range.start : nullptr,
+             winSize.width, winSize.height, criteria.maxCount, criteria.epsilon,
+             (flags & OPTFLOW_LK_GET_MIN_EIGENVALS) != 0,
+             (float)minEigThreshold);
 
-    for( int ptidx = range.start; ptidx < range.end; ptidx++ )
+    for (int ptidx = range.start; ptidx < range.end; ptidx++)
     {
-        Point2f prevPt = prevPtsScaled[ptidx-range.start];
+        Point2f prevPt = prevPtsScaled[ptidx - range.start];
         Point2i iprevPt, inextPt;
         prevPt -= halfWin;
         iprevPt.x = cvFloor(prevPt.x);
         iprevPt.y = cvFloor(prevPt.y);
 
-        if( iprevPt.x < -winSize.width || iprevPt.x >= derivI.cols ||
-            iprevPt.y < -winSize.height || iprevPt.y >= derivI.rows )
+        if (iprevPt.x < -winSize.width || iprevPt.x >= derivI.cols ||
+            iprevPt.y < -winSize.height || iprevPt.y >= derivI.rows)
         {
-            if( level == 0 )
+            if (level == 0)
             {
                 status[ptidx] = false;
-                if( err )
+                if (err)
                     err[ptidx] = 0;
             }
             continue;
@@ -256,29 +282,29 @@ void cv::detail::LKTrackerInvoker::operator()(const Range& range) const
 
         float a = prevPt.x - iprevPt.x;
         float b = prevPt.y - iprevPt.y;
-        int iw00 = cvRound((1.f - a)*(1.f - b)*(1 << W_BITS));
-        int iw01 = cvRound(a*(1.f - b)*(1 << W_BITS));
-        int iw10 = cvRound((1.f - a)*b*(1 << W_BITS));
+        int iw00 = cvRound((1.f - a) * (1.f - b) * (1 << W_BITS));
+        int iw01 = cvRound(a * (1.f - b) * (1 << W_BITS));
+        int iw10 = cvRound((1.f - a) * b * (1 << W_BITS));
         int iw11 = (1 << W_BITS) - iw00 - iw01 - iw10;
 
-        int dstep = (int)(derivI.step/derivI.elemSize1());
-        int stepI = (int)(I.step/I.elemSize1());
-        int stepJ = (int)(J.step/J.elemSize1());
+        int dstep = (int)(derivI.step / derivI.elemSize1());
+        int stepI = (int)(I.step / I.elemSize1());
+        int stepJ = (int)(J.step / J.elemSize1());
         acctype iA11 = 0, iA12 = 0, iA22 = 0;
         float A11, A12, A22;
 
 #if CV_SIMD128 && !CV_NEON
         v_int16x8 qw0((short)(iw00), (short)(iw01), (short)(iw00), (short)(iw01), (short)(iw00), (short)(iw01), (short)(iw00), (short)(iw01));
         v_int16x8 qw1((short)(iw10), (short)(iw11), (short)(iw10), (short)(iw11), (short)(iw10), (short)(iw11), (short)(iw10), (short)(iw11));
-        v_int32x4 qdelta_d = v_setall_s32(1 << (W_BITS1-1));
-        v_int32x4 qdelta = v_setall_s32(1 << (W_BITS1-5-1));
+        v_int32x4 qdelta_d = v_setall_s32(1 << (W_BITS1 - 1));
+        v_int32x4 qdelta = v_setall_s32(1 << (W_BITS1 - 5 - 1));
         v_float32x4 qA11 = v_setzero_f32(), qA12 = v_setzero_f32(), qA22 = v_setzero_f32();
 #endif
 
 #if CV_NEON
 
-        float CV_DECL_ALIGNED(16) nA11[] = { 0, 0, 0, 0 }, nA12[] = { 0, 0, 0, 0 }, nA22[] = { 0, 0, 0, 0 };
-        const int shifter1 = -(W_BITS - 5); //negative so it shifts right
+        float CV_DECL_ALIGNED(16) nA11[] = {0, 0, 0, 0}, nA12[] = {0, 0, 0, 0}, nA22[] = {0, 0, 0, 0};
+        const int shifter1 = -(W_BITS - 5); // negative so it shifts right
         const int shifter2 = -(W_BITS);
 
         const int16x4_t d26 = vdup_n_s16((int16_t)iw00);
@@ -292,18 +318,18 @@ void cv::detail::LKTrackerInvoker::operator()(const Range& range) const
 
         // extract the patch from the first image, compute covariation matrix of derivatives
         int x, y;
-        for( y = 0; y < winSize.height; y++ )
+        for (y = 0; y < winSize.height; y++)
         {
-            const uchar* src = I.ptr() + (y + iprevPt.y)*stepI + iprevPt.x*cn;
-            const deriv_type* dsrc = derivI.ptr<deriv_type>() + (y + iprevPt.y)*dstep + iprevPt.x*cn2;
+            const uchar *src = I.ptr() + (y + iprevPt.y) * stepI + iprevPt.x * cn;
+            const deriv_type *dsrc = derivI.ptr<deriv_type>() + (y + iprevPt.y) * dstep + iprevPt.x * cn2;
 
-            deriv_type* Iptr = IWinBuf.ptr<deriv_type>(y);
-            deriv_type* dIptr = derivIWinBuf.ptr<deriv_type>(y);
+            deriv_type *Iptr = IWinBuf.ptr<deriv_type>(y);
+            deriv_type *dIptr = derivIWinBuf.ptr<deriv_type>(y);
 
             x = 0;
 
 #if CV_SIMD128 && !CV_NEON
-            for( ; x <= winSize.width*cn - 8; x += 8, dsrc += 8*2, dIptr += 8*2 )
+            for (; x <= winSize.width * cn - 8; x += 8, dsrc += 8 * 2, dIptr += 8 * 2)
             {
                 v_int32x4 t0, t1;
                 v_int16x8 v00, v01, v10, v11, t00, t01, t10, t11;
@@ -347,10 +373,10 @@ void cv::detail::LKTrackerInvoker::operator()(const Range& range) const
                 qA12 = v_muladd(fx, fy, qA12);
                 qA11 = v_muladd(fx, fx, qA11);
 
-                v00 = v_reinterpret_as_s16(v_load(dsrc + 4*2));
-                v01 = v_reinterpret_as_s16(v_load(dsrc + 4*2 + cn2));
-                v10 = v_reinterpret_as_s16(v_load(dsrc + 4*2 + dstep));
-                v11 = v_reinterpret_as_s16(v_load(dsrc + 4*2 + dstep + cn2));
+                v00 = v_reinterpret_as_s16(v_load(dsrc + 4 * 2));
+                v01 = v_reinterpret_as_s16(v_load(dsrc + 4 * 2 + cn2));
+                v10 = v_reinterpret_as_s16(v_load(dsrc + 4 * 2 + dstep));
+                v11 = v_reinterpret_as_s16(v_load(dsrc + 4 * 2 + dstep + cn2));
 
                 v_zip(v00, v01, t00, t01);
                 v_zip(v10, v11, t10, t11);
@@ -360,7 +386,7 @@ void cv::detail::LKTrackerInvoker::operator()(const Range& range) const
                 t0 = v_shr<W_BITS1>(t0);
                 t1 = v_shr<W_BITS1>(t1);
                 v00 = v_pack(t0, t1); // Ix0 Iy0 Ix1 Iy1 ...
-                v_store(dIptr + 4*2, v00);
+                v_store(dIptr + 4 * 2, v00);
 
                 v00 = v_reinterpret_as_s16(v_interleave_pairs(v_reinterpret_as_s32(v_interleave_pairs(v00))));
                 v_expand(v00, t1, t0);
@@ -375,11 +401,11 @@ void cv::detail::LKTrackerInvoker::operator()(const Range& range) const
 #endif
 
 #if CV_NEON
-            for( ; x <= winSize.width*cn - 4; x += 4, dsrc += 4*2, dIptr += 4*2 )
+            for (; x <= winSize.width * cn - 4; x += 4, dsrc += 4 * 2, dIptr += 4 * 2)
             {
 
                 uint8x8_t d0 = vld1_u8(&src[x]);
-                uint8x8_t d2 = vld1_u8(&src[x+cn]);
+                uint8x8_t d2 = vld1_u8(&src[x + cn]);
                 uint16x8_t q0 = vmovl_u8(d0);
                 uint16x8_t q1 = vmovl_u8(d2);
 
@@ -414,7 +440,7 @@ void cv::detail::LKTrackerInvoker::operator()(const Range& range) const
                 vst1_s16(&Iptr[x], nd0);
 
                 int16x4x2_t d4d5 = vld2_s16(&dsrc[dstep]);
-                int16x4x2_t d6d7 = vld2_s16(&dsrc[dstep+cn2]);
+                int16x4x2_t d6d7 = vld2_s16(&dsrc[dstep + cn2]);
 
                 q4 = vaddq_s32(q4, q7);
                 q6 = vaddq_s32(q6, q8);
@@ -453,27 +479,31 @@ void cv::detail::LKTrackerInvoker::operator()(const Range& range) const
                 int16x4_t d12 = vmovn_s32(q6);
 
                 int16x4x2_t d8d12;
-                d8d12.val[0] = d8; d8d12.val[1] = d12;
+                d8d12.val[0] = d8;
+                d8d12.val[1] = d12;
                 vst2_s16(dIptr, d8d12);
             }
 #endif
 
-            for( ; x < winSize.width*cn; x++, dsrc += 2, dIptr += 2 )
+            for (; x < winSize.width * cn; x++, dsrc += 2, dIptr += 2)
             {
-                int ival = CV_DESCALE(src[x]*iw00 + src[x+cn]*iw01 +
-                                      src[x+stepI]*iw10 + src[x+stepI+cn]*iw11, W_BITS1-5);
-                int ixval = CV_DESCALE(dsrc[0]*iw00 + dsrc[cn2]*iw01 +
-                                       dsrc[dstep]*iw10 + dsrc[dstep+cn2]*iw11, W_BITS1);
-                int iyval = CV_DESCALE(dsrc[1]*iw00 + dsrc[cn2+1]*iw01 + dsrc[dstep+1]*iw10 +
-                                       dsrc[dstep+cn2+1]*iw11, W_BITS1);
+                int ival = CV_DESCALE(src[x] * iw00 + src[x + cn] * iw01 +
+                                          src[x + stepI] * iw10 + src[x + stepI + cn] * iw11,
+                                      W_BITS1 - 5);
+                int ixval = CV_DESCALE(dsrc[0] * iw00 + dsrc[cn2] * iw01 +
+                                           dsrc[dstep] * iw10 + dsrc[dstep + cn2] * iw11,
+                                       W_BITS1);
+                int iyval = CV_DESCALE(dsrc[1] * iw00 + dsrc[cn2 + 1] * iw01 + dsrc[dstep + 1] * iw10 +
+                                           dsrc[dstep + cn2 + 1] * iw11,
+                                       W_BITS1);
 
                 Iptr[x] = (short)ival;
                 dIptr[0] = (short)ixval;
                 dIptr[1] = (short)iyval;
 
-                iA11 += (itemtype)(ixval*ixval);
-                iA12 += (itemtype)(ixval*iyval);
-                iA22 += (itemtype)(iyval*iyval);
+                iA11 += (itemtype)(ixval * ixval);
+                iA12 += (itemtype)(ixval * iyval);
+                iA22 += (itemtype)(iyval * iyval);
             }
         }
 
@@ -489,47 +519,46 @@ void cv::detail::LKTrackerInvoker::operator()(const Range& range) const
         iA22 += nA22[0] + nA22[1] + nA22[2] + nA22[3];
 #endif
 
-        A11 = iA11*FLT_SCALE;
-        A12 = iA12*FLT_SCALE;
-        A22 = iA22*FLT_SCALE;
+        A11 = iA11 * FLT_SCALE;
+        A12 = iA12 * FLT_SCALE;
+        A22 = iA22 * FLT_SCALE;
 
-        float D = A11*A22 - A12*A12;
-        float minEig = (A22 + A11 - std::sqrt((A11-A22)*(A11-A22) +
-                        4.f*A12*A12))/(2*winSize.width*winSize.height);
+        float D = A11 * A22 - A12 * A12;
+        float minEig = (A22 + A11 - std::sqrt((A11 - A22) * (A11 - A22) + 4.f * A12 * A12)) / (2 * winSize.width * winSize.height);
 
-        if( err && (flags & OPTFLOW_LK_GET_MIN_EIGENVALS) != 0 )
+        if (err && (flags & OPTFLOW_LK_GET_MIN_EIGENVALS) != 0)
             err[ptidx] = (float)minEig;
 
-        if( minEig < minEigThreshold || D < FLT_EPSILON )
+        if (minEig < minEigThreshold || D < FLT_EPSILON)
         {
-            if(level == 0)
+            if (level == 0)
                 status[ptidx] = false;
             continue;
         }
 
-        D = 1.f/D;
+        D = 1.f / D;
 
         Point2f nextPt = nextPts[ptidx] - halfWin;
         Point2f prevDelta;
 
-        for( j = 0; j < criteria.maxCount; j++ )
+        for (j = 0; j < criteria.maxCount; j++)
         {
             inextPt.x = cvFloor(nextPt.x);
             inextPt.y = cvFloor(nextPt.y);
 
-            if( inextPt.x < -winSize.width || inextPt.x >= J.cols ||
-               inextPt.y < -winSize.height || inextPt.y >= J.rows )
+            if (inextPt.x < -winSize.width || inextPt.x >= J.cols ||
+                inextPt.y < -winSize.height || inextPt.y >= J.rows)
             {
-                if( level == 0 )
+                if (level == 0)
                     status[ptidx] = false;
                 break;
             }
 
             a = nextPt.x - inextPt.x;
             b = nextPt.y - inextPt.y;
-            iw00 = cvRound((1.f - a)*(1.f - b)*(1 << W_BITS));
-            iw01 = cvRound(a*(1.f - b)*(1 << W_BITS));
-            iw10 = cvRound((1.f - a)*b*(1 << W_BITS));
+            iw00 = cvRound((1.f - a) * (1.f - b) * (1 << W_BITS));
+            iw01 = cvRound(a * (1.f - b) * (1 << W_BITS));
+            iw10 = cvRound((1.f - a) * b * (1 << W_BITS));
             iw11 = (1 << W_BITS) - iw00 - iw01 - iw10;
             acctype ib1 = 0, ib2 = 0;
             float b1, b2;
@@ -540,7 +569,7 @@ void cv::detail::LKTrackerInvoker::operator()(const Range& range) const
 #endif
 
 #if CV_NEON
-            float CV_DECL_ALIGNED(16) nB1[] = { 0,0,0,0 }, nB2[] = { 0,0,0,0 };
+            float CV_DECL_ALIGNED(16) nB1[] = {0, 0, 0, 0}, nB2[] = {0, 0, 0, 0};
 
             const int16x4_t d26_2 = vdup_n_s16((int16_t)iw00);
             const int16x4_t d27_2 = vdup_n_s16((int16_t)iw01);
@@ -549,16 +578,16 @@ void cv::detail::LKTrackerInvoker::operator()(const Range& range) const
 
 #endif
 
-            for( y = 0; y < winSize.height; y++ )
+            for (y = 0; y < winSize.height; y++)
             {
-                const uchar* Jptr = J.ptr() + (y + inextPt.y)*stepJ + inextPt.x*cn;
-                const deriv_type* Iptr = IWinBuf.ptr<deriv_type>(y);
-                const deriv_type* dIptr = derivIWinBuf.ptr<deriv_type>(y);
+                const uchar *Jptr = J.ptr() + (y + inextPt.y) * stepJ + inextPt.x * cn;
+                const deriv_type *Iptr = IWinBuf.ptr<deriv_type>(y);
+                const deriv_type *dIptr = derivIWinBuf.ptr<deriv_type>(y);
 
                 x = 0;
 
 #if CV_SIMD128 && !CV_NEON
-                for( ; x <= winSize.width*cn - 8; x += 8, dIptr += 8*2 )
+                for (; x <= winSize.width * cn - 8; x += 8, dIptr += 8 * 2)
                 {
                     v_int16x8 diff0 = v_reinterpret_as_s16(v_load(Iptr + x)), diff1, diff2;
                     v_int16x8 v00 = v_reinterpret_as_s16(v_load_expand(Jptr + x));
@@ -576,7 +605,7 @@ void cv::detail::LKTrackerInvoker::operator()(const Range& range) const
                     t0 = v_shr<W_BITS1 - 5>(t0);
                     t1 = v_shr<W_BITS1 - 5>(t1);
                     diff0 = v_sub(v_pack(t0, t1), diff0);
-                    v_zip(diff0, diff0, diff2, diff1); // It0 It0 It1 It1 ...
+                    v_zip(diff0, diff0, diff2, diff1);         // It0 It0 It1 It1 ...
                     v00 = v_reinterpret_as_s16(v_load(dIptr)); // Ix0 Iy0 Ix1 Iy1 ...
                     v01 = v_reinterpret_as_s16(v_load(dIptr + 8));
                     v_zip(v00, v01, v10, v11);
@@ -587,13 +616,13 @@ void cv::detail::LKTrackerInvoker::operator()(const Range& range) const
 #endif
 
 #if CV_NEON
-                for( ; x <= winSize.width*cn - 8; x += 8, dIptr += 8*2 )
+                for (; x <= winSize.width * cn - 8; x += 8, dIptr += 8 * 2)
                 {
 
                     uint8x8_t d0 = vld1_u8(&Jptr[x]);
-                    uint8x8_t d2 = vld1_u8(&Jptr[x+cn]);
-                    uint8x8_t d4 = vld1_u8(&Jptr[x+stepJ]);
-                    uint8x8_t d6 = vld1_u8(&Jptr[x+stepJ+cn]);
+                    uint8x8_t d2 = vld1_u8(&Jptr[x + cn]);
+                    uint8x8_t d4 = vld1_u8(&Jptr[x + stepJ]);
+                    uint8x8_t d6 = vld1_u8(&Jptr[x + stepJ + cn]);
 
                     uint16x8_t q0 = vmovl_u8(d0);
                     uint16x8_t q1 = vmovl_u8(d2);
@@ -658,13 +687,14 @@ void cv::detail::LKTrackerInvoker::operator()(const Range& range) const
                 }
 #endif
 
-                for( ; x < winSize.width*cn; x++, dIptr += 2 )
+                for (; x < winSize.width * cn; x++, dIptr += 2)
                 {
-                    int diff = CV_DESCALE(Jptr[x]*iw00 + Jptr[x+cn]*iw01 +
-                                          Jptr[x+stepJ]*iw10 + Jptr[x+stepJ+cn]*iw11,
-                                          W_BITS1-5) - Iptr[x];
-                    ib1 += (itemtype)(diff*dIptr[0]);
-                    ib2 += (itemtype)(diff*dIptr[1]);
+                    int diff = CV_DESCALE(Jptr[x] * iw00 + Jptr[x + cn] * iw01 +
+                                              Jptr[x + stepJ] * iw10 + Jptr[x + stepJ + cn] * iw11,
+                                          W_BITS1 - 5) -
+                               Iptr[x];
+                    ib1 += (itemtype)(diff * dIptr[0]);
+                    ib2 += (itemtype)(diff * dIptr[1]);
                 }
             }
 
@@ -681,29 +711,29 @@ void cv::detail::LKTrackerInvoker::operator()(const Range& range) const
             ib2 += (float)(nB2[0] + nB2[1] + nB2[2] + nB2[3]);
 #endif
 
-            b1 = ib1*FLT_SCALE;
-            b2 = ib2*FLT_SCALE;
+            b1 = ib1 * FLT_SCALE;
+            b2 = ib2 * FLT_SCALE;
 
-            Point2f delta( (float)((A12*b2 - A22*b1) * D),
-                          (float)((A12*b1 - A11*b2) * D));
-            //delta = -delta;
+            Point2f delta((float)((A12 * b2 - A22 * b1) * D),
+                          (float)((A12 * b1 - A11 * b2) * D));
+            // delta = -delta;
 
             nextPt += delta;
             nextPts[ptidx] = nextPt + halfWin;
 
-            if( delta.ddot(delta) <= criteria.epsilon )
+            if (delta.ddot(delta) <= criteria.epsilon)
                 break;
 
-            if( j > 0 && std::abs(delta.x + prevDelta.x) < 0.01 &&
-               std::abs(delta.y + prevDelta.y) < 0.01 )
+            if (j > 0 && std::abs(delta.x + prevDelta.x) < 0.01 &&
+                std::abs(delta.y + prevDelta.y) < 0.01)
             {
-                nextPts[ptidx] -= delta*0.5f;
+                nextPts[ptidx] -= delta * 0.5f;
                 break;
             }
             prevDelta = delta;
         }
 
-        if( status[ptidx] && err && level == 0 && (flags & OPTFLOW_LK_GET_MIN_EIGENVALS) == 0 )
+        if (status[ptidx] && err && level == 0 && (flags & OPTFLOW_LK_GET_MIN_EIGENVALS) == 0)
         {
             Point2f nextPoint = nextPts[ptidx] - halfWin;
             Point inextPoint;
@@ -711,8 +741,8 @@ void cv::detail::LKTrackerInvoker::operator()(const Range& range) const
             inextPoint.x = cvFloor(nextPoint.x);
             inextPoint.y = cvFloor(nextPoint.y);
 
-            if( inextPoint.x < -winSize.width || inextPoint.x >= J.cols ||
-                inextPoint.y < -winSize.height || inextPoint.y >= J.rows )
+            if (inextPoint.x < -winSize.width || inextPoint.x >= J.cols ||
+                inextPoint.y < -winSize.height || inextPoint.y >= J.rows)
             {
                 status[ptidx] = false;
                 continue;
@@ -720,26 +750,27 @@ void cv::detail::LKTrackerInvoker::operator()(const Range& range) const
 
             float aa = nextPoint.x - inextPoint.x;
             float bb = nextPoint.y - inextPoint.y;
-            iw00 = cvRound((1.f - aa)*(1.f - bb)*(1 << W_BITS));
-            iw01 = cvRound(aa*(1.f - bb)*(1 << W_BITS));
-            iw10 = cvRound((1.f - aa)*bb*(1 << W_BITS));
+            iw00 = cvRound((1.f - aa) * (1.f - bb) * (1 << W_BITS));
+            iw01 = cvRound(aa * (1.f - bb) * (1 << W_BITS));
+            iw10 = cvRound((1.f - aa) * bb * (1 << W_BITS));
             iw11 = (1 << W_BITS) - iw00 - iw01 - iw10;
             float errval = 0.f;
 
-            for( y = 0; y < winSize.height; y++ )
+            for (y = 0; y < winSize.height; y++)
             {
-                const uchar* Jptr = J.ptr() + (y + inextPoint.y)*stepJ + inextPoint.x*cn;
-                const deriv_type* Iptr = IWinBuf.ptr<deriv_type>(y);
+                const uchar *Jptr = J.ptr() + (y + inextPoint.y) * stepJ + inextPoint.x * cn;
+                const deriv_type *Iptr = IWinBuf.ptr<deriv_type>(y);
 
-                for( x = 0; x < winSize.width*cn; x++ )
+                for (x = 0; x < winSize.width * cn; x++)
                 {
-                    int diff = CV_DESCALE(Jptr[x]*iw00 + Jptr[x+cn]*iw01 +
-                                          Jptr[x+stepJ]*iw10 + Jptr[x+stepJ+cn]*iw11,
-                                          W_BITS1-5) - Iptr[x];
+                    int diff = CV_DESCALE(Jptr[x] * iw00 + Jptr[x + cn] * iw01 +
+                                              Jptr[x + stepJ] * iw10 + Jptr[x + stepJ + cn] * iw11,
+                                          W_BITS1 - 5) -
+                               Iptr[x];
                     errval += std::abs((float)diff);
                 }
             }
-            err[ptidx] = errval * 1.f/(32*winSize.width*cn*winSize.height);
+            err[ptidx] = errval * 1.f / (32 * winSize.width * cn * winSize.height);
         }
     }
 }
@@ -750,39 +781,37 @@ int cv::buildOpticalFlowPyramid(InputArray _img, OutputArrayOfArrays pyramid, Si
     CV_INSTRUMENT_REGION();
 
     Mat img = _img.getMat();
-    CV_Assert(img.depth() == CV_8U && winSize.width > 2 && winSize.height > 2 );
+    CV_Assert(img.depth() == CV_8U && winSize.width > 2 && winSize.height > 2);
     int pyrstep = withDerivatives ? 2 : 1;
 
     pyramid.create(1, (maxLevel + 1) * pyrstep, 0 /*type*/, -1, true);
 
     int derivType = CV_MAKETYPE(DataType<cv::detail::deriv_type>::depth, img.channels() * 2);
 
-    //level 0
+    // level 0
     bool lvl0IsSet = false;
-    if(tryReuseInputImage && img.isSubmatrix() && (pyrBorder & BORDER_ISOLATED) == 0)
+    if (tryReuseInputImage && img.isSubmatrix() && (pyrBorder & BORDER_ISOLATED) == 0)
     {
         Size wholeSize;
         Point ofs;
         img.locateROI(wholeSize, ofs);
-        if (ofs.x >= winSize.width && ofs.y >= winSize.height
-              && ofs.x + img.cols + winSize.width <= wholeSize.width
-              && ofs.y + img.rows + winSize.height <= wholeSize.height)
+        if (ofs.x >= winSize.width && ofs.y >= winSize.height && ofs.x + img.cols + winSize.width <= wholeSize.width && ofs.y + img.rows + winSize.height <= wholeSize.height)
         {
             pyramid.getMatRef(0) = img;
             lvl0IsSet = true;
         }
     }
 
-    if(!lvl0IsSet)
+    if (!lvl0IsSet)
     {
-        Mat& temp = pyramid.getMatRef(0);
+        Mat &temp = pyramid.getMatRef(0);
 
-        if(!temp.empty())
+        if (!temp.empty())
             temp.adjustROI(winSize.height, winSize.height, winSize.width, winSize.width);
-        if(temp.type() != img.type() || temp.cols != winSize.width*2 + img.cols || temp.rows != winSize.height * 2 + img.rows)
-            temp.create(img.rows + winSize.height*2, img.cols + winSize.width*2, img.type());
+        if (temp.type() != img.type() || temp.cols != winSize.width * 2 + img.cols || temp.rows != winSize.height * 2 + img.rows)
+            temp.create(img.rows + winSize.height * 2, img.cols + winSize.width * 2, img.type());
 
-        if(pyrBorder == BORDER_TRANSPARENT)
+        if (pyrBorder == BORDER_TRANSPARENT)
             img.copyTo(temp(Rect(winSize.width, winSize.height, img.cols, img.rows)));
         else
             copyMakeBorder(img, temp, winSize.height, winSize.height, winSize.width, winSize.width, pyrBorder);
@@ -793,46 +822,46 @@ int cv::buildOpticalFlowPyramid(InputArray _img, OutputArrayOfArrays pyramid, Si
     Mat prevLevel = pyramid.getMatRef(0);
     Mat thisLevel = prevLevel;
 
-    for(int level = 0; level <= maxLevel; ++level)
+    for (int level = 0; level <= maxLevel; ++level)
     {
         if (level != 0)
         {
-            Mat& temp = pyramid.getMatRef(level * pyrstep);
+            Mat &temp = pyramid.getMatRef(level * pyrstep);
 
-            if(!temp.empty())
+            if (!temp.empty())
                 temp.adjustROI(winSize.height, winSize.height, winSize.width, winSize.width);
-            if(temp.type() != img.type() || temp.cols != winSize.width*2 + sz.width || temp.rows != winSize.height * 2 + sz.height)
-                temp.create(sz.height + winSize.height*2, sz.width + winSize.width*2, img.type());
+            if (temp.type() != img.type() || temp.cols != winSize.width * 2 + sz.width || temp.rows != winSize.height * 2 + sz.height)
+                temp.create(sz.height + winSize.height * 2, sz.width + winSize.width * 2, img.type());
 
             thisLevel = temp(Rect(winSize.width, winSize.height, sz.width, sz.height));
             pyrDown(prevLevel, thisLevel, sz);
 
-            if(pyrBorder != BORDER_TRANSPARENT)
-                copyMakeBorder(thisLevel, temp, winSize.height, winSize.height, winSize.width, winSize.width, pyrBorder|BORDER_ISOLATED);
+            if (pyrBorder != BORDER_TRANSPARENT)
+                copyMakeBorder(thisLevel, temp, winSize.height, winSize.height, winSize.width, winSize.width, pyrBorder | BORDER_ISOLATED);
             temp.adjustROI(-winSize.height, -winSize.height, -winSize.width, -winSize.width);
         }
 
-        if(withDerivatives)
+        if (withDerivatives)
         {
-            Mat& deriv = pyramid.getMatRef(level * pyrstep + 1);
+            Mat &deriv = pyramid.getMatRef(level * pyrstep + 1);
 
-            if(!deriv.empty())
+            if (!deriv.empty())
                 deriv.adjustROI(winSize.height, winSize.height, winSize.width, winSize.width);
-            if(deriv.type() != derivType || deriv.cols != winSize.width*2 + sz.width || deriv.rows != winSize.height * 2 + sz.height)
-                deriv.create(sz.height + winSize.height*2, sz.width + winSize.width*2, derivType);
+            if (deriv.type() != derivType || deriv.cols != winSize.width * 2 + sz.width || deriv.rows != winSize.height * 2 + sz.height)
+                deriv.create(sz.height + winSize.height * 2, sz.width + winSize.width * 2, derivType);
 
             Mat derivI = deriv(Rect(winSize.width, winSize.height, sz.width, sz.height));
             calcScharrDeriv(thisLevel, derivI);
 
-            if(derivBorder != BORDER_TRANSPARENT)
-                copyMakeBorder(derivI, deriv, winSize.height, winSize.height, winSize.width, winSize.width, derivBorder|BORDER_ISOLATED);
+            if (derivBorder != BORDER_TRANSPARENT)
+                copyMakeBorder(derivI, deriv, winSize.height, winSize.height, winSize.width, winSize.width, derivBorder | BORDER_ISOLATED);
             deriv.adjustROI(-winSize.height, -winSize.height, -winSize.width, -winSize.width);
         }
 
-        sz = Size((sz.width+1)/2, (sz.height+1)/2);
-        if( sz.width <= winSize.width || sz.height <= winSize.height )
+        sz = Size((sz.width + 1) / 2, (sz.height + 1) / 2);
+        if (sz.width <= winSize.width || sz.height <= winSize.height)
         {
-            pyramid.create(1, (level + 1) * pyrstep, 0 /*type*/, -1, true);//check this
+            pyramid.create(1, (level + 1) * pyrstep, 0 /*type*/, -1, true); // check this
             return level;
         }
 
@@ -844,607 +873,608 @@ int cv::buildOpticalFlowPyramid(InputArray _img, OutputArrayOfArrays pyramid, Si
 
 namespace cv
 {
-namespace
-{
-    class SparsePyrLKOpticalFlowImpl : public SparsePyrLKOpticalFlow
+    namespace
     {
-        struct dim3
+        class SparsePyrLKOpticalFlowImpl : public SparsePyrLKOpticalFlow
         {
-            unsigned int x, y, z;
-            dim3() : x(0), y(0), z(0) { }
-        };
-    public:
-        SparsePyrLKOpticalFlowImpl(Size winSize_ = Size(21,21),
-                         int maxLevel_ = 3,
-                         TermCriteria criteria_ = TermCriteria(TermCriteria::COUNT+TermCriteria::EPS, 30, 0.01),
-                         int flags_ = 0,
-                         double minEigThreshold_ = 1e-4) :
-          winSize(winSize_), maxLevel(maxLevel_), criteria(criteria_), flags(flags_), minEigThreshold(minEigThreshold_)
-#ifdef HAVE_OPENCL
-          , iters(criteria_.maxCount), derivLambda(criteria_.epsilon), useInitialFlow(0 != (flags_ & OPTFLOW_LK_GET_MIN_EIGENVALS))
-#endif
-        {
-        }
-
-        virtual Size getWinSize() const CV_OVERRIDE { return winSize;}
-        virtual void setWinSize(Size winSize_) CV_OVERRIDE { winSize = winSize_;}
-
-        virtual int getMaxLevel() const CV_OVERRIDE { return maxLevel;}
-        virtual void setMaxLevel(int maxLevel_) CV_OVERRIDE { maxLevel = maxLevel_;}
-
-        virtual TermCriteria getTermCriteria() const CV_OVERRIDE { return criteria;}
-        virtual void setTermCriteria(TermCriteria& crit_) CV_OVERRIDE { criteria=crit_;}
-
-        virtual int getFlags() const CV_OVERRIDE { return flags; }
-        virtual void setFlags(int flags_) CV_OVERRIDE { flags=flags_;}
-
-        virtual double getMinEigThreshold() const CV_OVERRIDE { return minEigThreshold;}
-        virtual void setMinEigThreshold(double minEigThreshold_) CV_OVERRIDE { minEigThreshold=minEigThreshold_;}
-
-        virtual void calc(InputArray prevImg, InputArray nextImg,
-                          InputArray prevPts, InputOutputArray nextPts,
-                          OutputArray status,
-                          OutputArray err = cv::noArray()) CV_OVERRIDE;
-
-        virtual String getDefaultName() const CV_OVERRIDE { return "SparseOpticalFlow.SparsePyrLKOpticalFlow"; }
-
-    private:
-#ifdef HAVE_OPENCL
-        bool checkParam()
-        {
-            iters = std::min(std::max(iters, 0), 100);
-
-            derivLambda = std::min(std::max(derivLambda, 0.0), 1.0);
-            if (derivLambda < 0)
-                return false;
-            if (maxLevel < 0 || winSize.width <= 2 || winSize.height <= 2)
-                return false;
-            if (winSize.width < 8 || winSize.height < 8 ||
-                winSize.width > 24 || winSize.height > 24)
-                return false;
-            calcPatchSize();
-            if (patch.x <= 0 || patch.x >= 6 || patch.y <= 0 || patch.y >= 6)
-                return false;
-            return true;
-        }
-
-        bool sparse(const UMat &prevImg, const UMat &nextImg, const UMat &prevPts, UMat &nextPts, UMat &status, UMat &err)
-        {
-            if (!checkParam())
-                return false;
-
-            UMat temp1 = (useInitialFlow ? nextPts : prevPts).reshape(1);
-            UMat temp2 = nextPts.reshape(1);
-            multiply(1.0f / (1 << maxLevel) /2.0f, temp1, temp2);
-
-            status.setTo(Scalar::all(1));
-
-            // build the image pyramids.
-            std::vector<UMat> prevPyr; prevPyr.resize(maxLevel + 1);
-            std::vector<UMat> nextPyr; nextPyr.resize(maxLevel + 1);
-
-            // allocate buffers with aligned pitch to be able to use cl_khr_image2d_from_buffer extension
-            // This is the required pitch alignment in pixels
-            int pitchAlign = (int)ocl::Device::getDefault().imagePitchAlignment();
-            if (pitchAlign>0)
+            struct dim3
             {
-                prevPyr[0] = UMat(prevImg.rows,(prevImg.cols+pitchAlign-1)&(-pitchAlign),CV_32FC1).colRange(0,prevImg.cols);
-                nextPyr[0] = UMat(nextImg.rows,(nextImg.cols+pitchAlign-1)&(-pitchAlign),CV_32FC1).colRange(0,nextImg.cols);
+                unsigned int x, y, z;
+                dim3() : x(0), y(0), z(0) {}
+            };
+
+        public:
+            SparsePyrLKOpticalFlowImpl(Size winSize_ = Size(21, 21),
+                                       int maxLevel_ = 3,
+                                       TermCriteria criteria_ = TermCriteria(TermCriteria::COUNT + TermCriteria::EPS, 30, 0.01),
+                                       int flags_ = 0,
+                                       double minEigThreshold_ = 1e-4) : winSize(winSize_), maxLevel(maxLevel_), criteria(criteria_), flags(flags_), minEigThreshold(minEigThreshold_)
+#ifdef HAVE_OPENCL
+                                                                         ,
+                                                                         iters(criteria_.maxCount), derivLambda(criteria_.epsilon), useInitialFlow(0 != (flags_ & OPTFLOW_LK_GET_MIN_EIGENVALS))
+#endif
+            {
+            }
+
+            virtual Size getWinSize() const CV_OVERRIDE { return winSize; }
+            virtual void setWinSize(Size winSize_) CV_OVERRIDE { winSize = winSize_; }
+
+            virtual int getMaxLevel() const CV_OVERRIDE { return maxLevel; }
+            virtual void setMaxLevel(int maxLevel_) CV_OVERRIDE { maxLevel = maxLevel_; }
+
+            virtual TermCriteria getTermCriteria() const CV_OVERRIDE { return criteria; }
+            virtual void setTermCriteria(TermCriteria &crit_) CV_OVERRIDE { criteria = crit_; }
+
+            virtual int getFlags() const CV_OVERRIDE { return flags; }
+            virtual void setFlags(int flags_) CV_OVERRIDE { flags = flags_; }
+
+            virtual double getMinEigThreshold() const CV_OVERRIDE { return minEigThreshold; }
+            virtual void setMinEigThreshold(double minEigThreshold_) CV_OVERRIDE { minEigThreshold = minEigThreshold_; }
+
+            virtual void calc(InputArray prevImg, InputArray nextImg,
+                              InputArray prevPts, InputOutputArray nextPts,
+                              OutputArray status,
+                              OutputArray err = cv::noArray()) CV_OVERRIDE;
+
+            virtual String getDefaultName() const CV_OVERRIDE { return "SparseOpticalFlow.SparsePyrLKOpticalFlow"; }
+
+        private:
+#ifdef HAVE_OPENCL
+            bool checkParam()
+            {
+                iters = std::min(std::max(iters, 0), 100);
+
+                derivLambda = std::min(std::max(derivLambda, 0.0), 1.0);
+                if (derivLambda < 0)
+                    return false;
+                if (maxLevel < 0 || winSize.width <= 2 || winSize.height <= 2)
+                    return false;
+                if (winSize.width < 8 || winSize.height < 8 ||
+                    winSize.width > 24 || winSize.height > 24)
+                    return false;
+                calcPatchSize();
+                if (patch.x <= 0 || patch.x >= 6 || patch.y <= 0 || patch.y >= 6)
+                    return false;
+                return true;
+            }
+
+            bool sparse(const UMat &prevImg, const UMat &nextImg, const UMat &prevPts, UMat &nextPts, UMat &status, UMat &err)
+            {
+                if (!checkParam())
+                    return false;
+
+                UMat temp1 = (useInitialFlow ? nextPts : prevPts).reshape(1);
+                UMat temp2 = nextPts.reshape(1);
+                multiply(1.0f / (1 << maxLevel) / 2.0f, temp1, temp2);
+
+                status.setTo(Scalar::all(1));
+
+                // build the image pyramids.
+                std::vector<UMat> prevPyr;
+                prevPyr.resize(maxLevel + 1);
+                std::vector<UMat> nextPyr;
+                nextPyr.resize(maxLevel + 1);
+
+                // allocate buffers with aligned pitch to be able to use cl_khr_image2d_from_buffer extension
+                // This is the required pitch alignment in pixels
+                int pitchAlign = (int)ocl::Device::getDefault().imagePitchAlignment();
+                if (pitchAlign > 0)
+                {
+                    prevPyr[0] = UMat(prevImg.rows, (prevImg.cols + pitchAlign - 1) & (-pitchAlign), CV_32FC1).colRange(0, prevImg.cols);
+                    nextPyr[0] = UMat(nextImg.rows, (nextImg.cols + pitchAlign - 1) & (-pitchAlign), CV_32FC1).colRange(0, nextImg.cols);
+                    for (int level = 1; level <= maxLevel; ++level)
+                    {
+                        int cols, rows;
+                        // allocate buffers with aligned pitch to be able to use image on buffer extension
+                        cols = (prevPyr[level - 1].cols + 1) / 2;
+                        rows = (prevPyr[level - 1].rows + 1) / 2;
+                        prevPyr[level] = UMat(rows, (cols + pitchAlign - 1) & (-pitchAlign), prevPyr[level - 1].type()).colRange(0, cols);
+                        cols = (nextPyr[level - 1].cols + 1) / 2;
+                        rows = (nextPyr[level - 1].rows + 1) / 2;
+                        nextPyr[level] = UMat(rows, (cols + pitchAlign - 1) & (-pitchAlign), nextPyr[level - 1].type()).colRange(0, cols);
+                    }
+                }
+
+                prevImg.convertTo(prevPyr[0], CV_32F);
+                nextImg.convertTo(nextPyr[0], CV_32F);
+
                 for (int level = 1; level <= maxLevel; ++level)
                 {
-                    int cols,rows;
-                    // allocate buffers with aligned pitch to be able to use image on buffer extension
-                    cols = (prevPyr[level - 1].cols+1)/2;
-                    rows = (prevPyr[level - 1].rows+1)/2;
-                    prevPyr[level] = UMat(rows,(cols+pitchAlign-1)&(-pitchAlign),prevPyr[level-1].type()).colRange(0,cols);
-                    cols = (nextPyr[level - 1].cols+1)/2;
-                    rows = (nextPyr[level - 1].rows+1)/2;
-                    nextPyr[level] = UMat(rows,(cols+pitchAlign-1)&(-pitchAlign),nextPyr[level-1].type()).colRange(0,cols);
+                    pyrDown(prevPyr[level - 1], prevPyr[level]);
+                    pyrDown(nextPyr[level - 1], nextPyr[level]);
                 }
-            }
 
-            prevImg.convertTo(prevPyr[0], CV_32F);
-            nextImg.convertTo(nextPyr[0], CV_32F);
-
-            for (int level = 1; level <= maxLevel; ++level)
-            {
-                pyrDown(prevPyr[level - 1], prevPyr[level]);
-                pyrDown(nextPyr[level - 1], nextPyr[level]);
+                // dI/dx ~ Ix, dI/dy ~ Iy
+                for (int level = maxLevel; level >= 0; level--)
+                {
+                    if (!lkSparse_run(prevPyr[level], nextPyr[level], prevPts,
+                                      nextPts, status, err,
+                                      static_cast<int>(prevPts.total()),
+                                      level))
+                        return false;
+                }
+                return true;
             }
-
-            // dI/dx ~ Ix, dI/dy ~ Iy
-            for (int level = maxLevel; level >= 0; level--)
-            {
-                if (!lkSparse_run(prevPyr[level], nextPyr[level], prevPts,
-                                  nextPts, status, err,
-                                  static_cast<int>(prevPts.total()),
-                                  level))
-                    return false;
-            }
-            return true;
-        }
 #endif
 
-        Size winSize;
-        int maxLevel;
-        TermCriteria criteria;
-        int flags;
-        double minEigThreshold;
+            Size winSize;
+            int maxLevel;
+            TermCriteria criteria;
+            int flags;
+            double minEigThreshold;
 #ifdef HAVE_OPENCL
-        int iters;
-        double derivLambda;
-        bool useInitialFlow;
-        dim3 patch;
-        void calcPatchSize()
-        {
-            dim3 block;
-
-            if (winSize.width > 32 && winSize.width > 2 * winSize.height)
+            int iters;
+            double derivLambda;
+            bool useInitialFlow;
+            dim3 patch;
+            void calcPatchSize()
             {
-                block.x = 32;
-                block.y = 8;
+                dim3 block;
+
+                if (winSize.width > 32 && winSize.width > 2 * winSize.height)
+                {
+                    block.x = 32;
+                    block.y = 8;
+                }
+                else
+                {
+                    block.x = 16;
+                    block.y = 16;
+                }
+
+                patch.x = (winSize.width + block.x - 1) / block.x;
+                patch.y = (winSize.height + block.y - 1) / block.y;
+
+                block.z = patch.z = 1;
             }
-            else
+
+            bool lkSparse_run(UMat &I, UMat &J, const UMat &prevPts, UMat &nextPts, UMat &status, UMat &err,
+                              int ptcount, int level)
             {
-                block.x = 16;
-                block.y = 16;
+                size_t localThreads[3] = {8, 8};
+                size_t globalThreads[3] = {8 * (size_t)ptcount, 8};
+                char calcErr = (0 == level) ? 1 : 0;
+
+                int wsx = 1, wsy = 1;
+                if (winSize.width < 16)
+                    wsx = 0;
+                if (winSize.height < 16)
+                    wsy = 0;
+                cv::String build_options;
+                if (isDeviceCPU())
+                    build_options = " -D CPU";
+                else
+                    build_options = cv::format("-D WSX=%d -D WSY=%d",
+                                               wsx, wsy);
+
+                ocl::Kernel kernel;
+                if (!kernel.create("lkSparse", cv::ocl::video::pyrlk_oclsrc, build_options))
+                    return false;
+
+                CV_Assert(I.depth() == CV_32F && J.depth() == CV_32F);
+                ocl::Image2D imageI(I, false, ocl::Image2D::canCreateAlias(I));
+                ocl::Image2D imageJ(J, false, ocl::Image2D::canCreateAlias(J));
+
+                int idxArg = 0;
+                idxArg = kernel.set(idxArg, imageI);                                // image2d_t I
+                idxArg = kernel.set(idxArg, imageJ);                                // image2d_t J
+                idxArg = kernel.set(idxArg, ocl::KernelArg::PtrReadOnly(prevPts));  // __global const float2* prevPts
+                idxArg = kernel.set(idxArg, ocl::KernelArg::PtrReadWrite(nextPts)); // __global const float2* nextPts
+                idxArg = kernel.set(idxArg, ocl::KernelArg::PtrReadWrite(status));  // __global uchar* status
+                idxArg = kernel.set(idxArg, ocl::KernelArg::PtrReadWrite(err));     // __global float* err
+                idxArg = kernel.set(idxArg, (int)level);                            // const int level
+                idxArg = kernel.set(idxArg, (int)I.rows);                           // const int rows
+                idxArg = kernel.set(idxArg, (int)I.cols);                           // const int cols
+                idxArg = kernel.set(idxArg, (int)patch.x);                          // int PATCH_X
+                idxArg = kernel.set(idxArg, (int)patch.y);                          // int PATCH_Y
+                idxArg = kernel.set(idxArg, (int)winSize.width);                    // int c_winSize_x
+                idxArg = kernel.set(idxArg, (int)winSize.height);                   // int c_winSize_y
+                idxArg = kernel.set(idxArg, (int)iters);                            // int c_iters
+                idxArg = kernel.set(idxArg, (char)calcErr);                         // char calcErr
+                return kernel.run(2, globalThreads, localThreads, true);            // sync=true because ocl::Image2D lifetime is not handled well for temp UMat
             }
 
-            patch.x = (winSize.width  + block.x - 1) / block.x;
-            patch.y = (winSize.height + block.y - 1) / block.y;
+        private:
+            inline static bool isDeviceCPU()
+            {
+                return (cv::ocl::Device::TYPE_CPU == cv::ocl::Device::getDefault().type());
+            }
 
-            block.z = patch.z = 1;
-        }
+            bool ocl_calcOpticalFlowPyrLK(InputArray _prevImg, InputArray _nextImg,
+                                          InputArray _prevPts, InputOutputArray _nextPts,
+                                          OutputArray _status, OutputArray _err)
+            {
+                if (0 != (OPTFLOW_LK_GET_MIN_EIGENVALS & flags))
+                    return false;
+                if (!cv::ocl::Device::getDefault().imageSupport())
+                    return false;
+                if (_nextImg.size() != _prevImg.size())
+                    return false;
+                int typePrev = _prevImg.type();
+                int typeNext = _nextImg.type();
+                if ((1 != CV_MAT_CN(typePrev)) || (1 != CV_MAT_CN(typeNext)))
+                    return false;
+                if ((0 != CV_MAT_DEPTH(typePrev)) || (0 != CV_MAT_DEPTH(typeNext)))
+                    return false;
 
-        bool lkSparse_run(UMat &I, UMat &J, const UMat &prevPts, UMat &nextPts, UMat &status, UMat& err,
-            int ptcount, int level)
-        {
-            size_t localThreads[3]  = { 8, 8};
-            size_t globalThreads[3] = { 8 * (size_t)ptcount, 8};
-            char calcErr = (0 == level) ? 1 : 0;
+                if (_prevPts.empty() || _prevPts.type() != CV_32FC2 || (!_prevPts.isContinuous()))
+                    return false;
+                if ((1 != _prevPts.size().height) && (1 != _prevPts.size().width))
+                    return false;
+                size_t npoints = _prevPts.total();
+                if (useInitialFlow)
+                {
+                    if (_nextPts.empty() || _nextPts.type() != CV_32FC2 || (!_prevPts.isContinuous()))
+                        return false;
+                    if ((1 != _nextPts.size().height) && (1 != _nextPts.size().width))
+                        return false;
+                    if (_nextPts.total() != npoints)
+                        return false;
+                }
+                else
+                {
+                    _nextPts.create(_prevPts.size(), _prevPts.type());
+                }
 
-            int wsx = 1, wsy = 1;
-            if(winSize.width < 16)
-                wsx = 0;
-            if(winSize.height < 16)
-                wsy = 0;
-            cv::String build_options;
-            if (isDeviceCPU())
-                build_options = " -D CPU";
-            else
-                build_options = cv::format("-D WSX=%d -D WSY=%d",
-                                           wsx, wsy);
+                if (!checkParam())
+                    return false;
 
-            ocl::Kernel kernel;
-            if (!kernel.create("lkSparse", cv::ocl::video::pyrlk_oclsrc, build_options))
-                return false;
+                UMat umatErr;
+                if (_err.needed())
+                {
+                    _err.create((int)npoints, 1, CV_32FC1);
+                    umatErr = _err.getUMat();
+                }
+                else
+                    umatErr.create((int)npoints, 1, CV_32FC1);
 
-            CV_Assert(I.depth() == CV_32F && J.depth() == CV_32F);
-            ocl::Image2D imageI(I, false, ocl::Image2D::canCreateAlias(I));
-            ocl::Image2D imageJ(J, false, ocl::Image2D::canCreateAlias(J));
-
-            int idxArg = 0;
-            idxArg = kernel.set(idxArg, imageI); //image2d_t I
-            idxArg = kernel.set(idxArg, imageJ); //image2d_t J
-            idxArg = kernel.set(idxArg, ocl::KernelArg::PtrReadOnly(prevPts)); // __global const float2* prevPts
-            idxArg = kernel.set(idxArg, ocl::KernelArg::PtrReadWrite(nextPts)); // __global const float2* nextPts
-            idxArg = kernel.set(idxArg, ocl::KernelArg::PtrReadWrite(status)); // __global uchar* status
-            idxArg = kernel.set(idxArg, ocl::KernelArg::PtrReadWrite(err)); // __global float* err
-            idxArg = kernel.set(idxArg, (int)level); // const int level
-            idxArg = kernel.set(idxArg, (int)I.rows); // const int rows
-            idxArg = kernel.set(idxArg, (int)I.cols); // const int cols
-            idxArg = kernel.set(idxArg, (int)patch.x); // int PATCH_X
-            idxArg = kernel.set(idxArg, (int)patch.y); // int PATCH_Y
-            idxArg = kernel.set(idxArg, (int)winSize.width); // int c_winSize_x
-            idxArg = kernel.set(idxArg, (int)winSize.height); // int c_winSize_y
-            idxArg = kernel.set(idxArg, (int)iters); // int c_iters
-            idxArg = kernel.set(idxArg, (char)calcErr); //char calcErr
-            return kernel.run(2, globalThreads, localThreads, true); // sync=true because ocl::Image2D lifetime is not handled well for temp UMat
-        }
-    private:
-        inline static bool isDeviceCPU()
-        {
-            return (cv::ocl::Device::TYPE_CPU == cv::ocl::Device::getDefault().type());
-        }
-
-
-    bool ocl_calcOpticalFlowPyrLK(InputArray _prevImg, InputArray _nextImg,
-                                         InputArray _prevPts, InputOutputArray _nextPts,
-                                         OutputArray _status, OutputArray _err)
-    {
-        if (0 != (OPTFLOW_LK_GET_MIN_EIGENVALS & flags))
-            return false;
-        if (!cv::ocl::Device::getDefault().imageSupport())
-            return false;
-        if (_nextImg.size() != _prevImg.size())
-            return false;
-        int typePrev = _prevImg.type();
-        int typeNext = _nextImg.type();
-        if ((1 != CV_MAT_CN(typePrev)) || (1 != CV_MAT_CN(typeNext)))
-            return false;
-        if ((0 != CV_MAT_DEPTH(typePrev)) || (0 != CV_MAT_DEPTH(typeNext)))
-            return false;
-
-        if (_prevPts.empty() || _prevPts.type() != CV_32FC2 || (!_prevPts.isContinuous()))
-            return false;
-        if ((1 != _prevPts.size().height) && (1 != _prevPts.size().width))
-            return false;
-        size_t npoints = _prevPts.total();
-        if (useInitialFlow)
-        {
-            if (_nextPts.empty() || _nextPts.type() != CV_32FC2 || (!_prevPts.isContinuous()))
-                return false;
-            if ((1 != _nextPts.size().height) && (1 != _nextPts.size().width))
-                return false;
-            if (_nextPts.total() != npoints)
-                return false;
-        }
-        else
-        {
-            _nextPts.create(_prevPts.size(), _prevPts.type());
-        }
-
-        if (!checkParam())
-            return false;
-
-        UMat umatErr;
-        if (_err.needed())
-        {
-            _err.create((int)npoints, 1, CV_32FC1);
-            umatErr = _err.getUMat();
-        }
-        else
-            umatErr.create((int)npoints, 1, CV_32FC1);
-
-        _status.create((int)npoints, 1, CV_8UC1);
-        UMat umatNextPts = _nextPts.getUMat();
-        UMat umatStatus = _status.getUMat();
-        UMat umatPrevPts;
-        _prevPts.getMat().copyTo(umatPrevPts);
-        return sparse(_prevImg.getUMat(), _nextImg.getUMat(), umatPrevPts, umatNextPts, umatStatus, umatErr);
-    }
+                _status.create((int)npoints, 1, CV_8UC1);
+                UMat umatNextPts = _nextPts.getUMat();
+                UMat umatStatus = _status.getUMat();
+                UMat umatPrevPts;
+                _prevPts.getMat().copyTo(umatPrevPts);
+                return sparse(_prevImg.getUMat(), _nextImg.getUMat(), umatPrevPts, umatNextPts, umatStatus, umatErr);
+            }
 #endif
 
 #ifdef HAVE_OPENVX
-    bool openvx_pyrlk(InputArray _prevImg, InputArray _nextImg, InputArray _prevPts, InputOutputArray _nextPts,
-                             OutputArray _status, OutputArray _err)
-    {
-        using namespace ivx;
-
-        // Pyramids as inputs are not acceptable because there's no (direct or simple) way
-        // to build vx_pyramid on user data
-        if(_prevImg.kind() != _InputArray::MAT || _nextImg.kind() != _InputArray::MAT)
-            return false;
-
-        Mat prevImgMat = _prevImg.getMat(), nextImgMat = _nextImg.getMat();
-
-        if(prevImgMat.type() != CV_8UC1 || nextImgMat.type() != CV_8UC1)
-            return false;
-
-        if (ovx::skipSmallImages<VX_KERNEL_OPTICAL_FLOW_PYR_LK>(prevImgMat.cols, prevImgMat.rows))
-            return false;
-
-        CV_Assert(prevImgMat.size() == nextImgMat.size());
-        Mat prevPtsMat = _prevPts.getMat();
-        int checkPrev = prevPtsMat.checkVector(2, CV_32F, false);
-        CV_Assert( checkPrev >= 0 );
-        size_t npoints = checkPrev;
-
-        if( !(flags & OPTFLOW_USE_INITIAL_FLOW) )
-            _nextPts.create(prevPtsMat.size(), prevPtsMat.type(), -1, true);
-        Mat nextPtsMat = _nextPts.getMat();
-        CV_Assert( nextPtsMat.checkVector(2, CV_32F, false) == (int)npoints );
-
-        _status.create((int)npoints, 1, CV_8U, -1, true);
-        Mat statusMat = _status.getMat();
-        uchar* status = statusMat.ptr();
-        for(size_t i = 0; i < npoints; i++ )
-            status[i] = true;
-
-        // OpenVX doesn't return detection errors
-        if( _err.needed() )
-        {
-            return false;
-        }
-
-        try
-        {
-            Context context = ovx::getOpenVXContext();
-
-            if(context.vendorID() == VX_ID_KHRONOS)
+            bool openvx_pyrlk(InputArray _prevImg, InputArray _nextImg, InputArray _prevPts, InputOutputArray _nextPts,
+                              OutputArray _status, OutputArray _err)
             {
-                // PyrLK in OVX 1.0.1 performs vxCommitImagePatch incorrecty and crashes
-                if(VX_VERSION == VX_VERSION_1_0)
+                using namespace ivx;
+
+                // Pyramids as inputs are not acceptable because there's no (direct or simple) way
+                // to build vx_pyramid on user data
+                if (_prevImg.kind() != _InputArray::MAT || _nextImg.kind() != _InputArray::MAT)
                     return false;
-                // Implementation ignores border mode
-                // So check that minimal size of image in pyramid is big enough
-                int width = prevImgMat.cols, height = prevImgMat.rows;
-                for(int i = 0; i < maxLevel+1; i++)
+
+                Mat prevImgMat = _prevImg.getMat(), nextImgMat = _nextImg.getMat();
+
+                if (prevImgMat.type() != CV_8UC1 || nextImgMat.type() != CV_8UC1)
+                    return false;
+
+                if (ovx::skipSmallImages<VX_KERNEL_OPTICAL_FLOW_PYR_LK>(prevImgMat.cols, prevImgMat.rows))
+                    return false;
+
+                CV_Assert(prevImgMat.size() == nextImgMat.size());
+                Mat prevPtsMat = _prevPts.getMat();
+                int checkPrev = prevPtsMat.checkVector(2, CV_32F, false);
+                CV_Assert(checkPrev >= 0);
+                size_t npoints = checkPrev;
+
+                if (!(flags & OPTFLOW_USE_INITIAL_FLOW))
+                    _nextPts.create(prevPtsMat.size(), prevPtsMat.type(), -1, true);
+                Mat nextPtsMat = _nextPts.getMat();
+                CV_Assert(nextPtsMat.checkVector(2, CV_32F, false) == (int)npoints);
+
+                _status.create((int)npoints, 1, CV_8U, -1, true);
+                Mat statusMat = _status.getMat();
+                uchar *status = statusMat.ptr();
+                for (size_t i = 0; i < npoints; i++)
+                    status[i] = true;
+
+                // OpenVX doesn't return detection errors
+                if (_err.needed())
                 {
-                    if(width < winSize.width + 1 || height < winSize.height + 1)
-                        return false;
-                    else
-                    {
-                        width /= 2; height /= 2;
-                    }
+                    return false;
                 }
+
+                try
+                {
+                    Context context = ovx::getOpenVXContext();
+
+                    if (context.vendorID() == VX_ID_KHRONOS)
+                    {
+                        // PyrLK in OVX 1.0.1 performs vxCommitImagePatch incorrecty and crashes
+                        if (VX_VERSION == VX_VERSION_1_0)
+                            return false;
+                        // Implementation ignores border mode
+                        // So check that minimal size of image in pyramid is big enough
+                        int width = prevImgMat.cols, height = prevImgMat.rows;
+                        for (int i = 0; i < maxLevel + 1; i++)
+                        {
+                            if (width < winSize.width + 1 || height < winSize.height + 1)
+                                return false;
+                            else
+                            {
+                                width /= 2;
+                                height /= 2;
+                            }
+                        }
+                    }
+
+                    Image prevImg = Image::createFromHandle(context, Image::matTypeToFormat(prevImgMat.type()),
+                                                            Image::createAddressing(prevImgMat), (void *)prevImgMat.data);
+                    Image nextImg = Image::createFromHandle(context, Image::matTypeToFormat(nextImgMat.type()),
+                                                            Image::createAddressing(nextImgMat), (void *)nextImgMat.data);
+
+                    Graph graph = Graph::create(context);
+
+                    Pyramid prevPyr = Pyramid::createVirtual(graph, (vx_size)maxLevel + 1, VX_SCALE_PYRAMID_HALF,
+                                                             prevImg.width(), prevImg.height(), prevImg.format());
+                    Pyramid nextPyr = Pyramid::createVirtual(graph, (vx_size)maxLevel + 1, VX_SCALE_PYRAMID_HALF,
+                                                             nextImg.width(), nextImg.height(), nextImg.format());
+
+                    ivx::Node::create(graph, VX_KERNEL_GAUSSIAN_PYRAMID, prevImg, prevPyr);
+                    ivx::Node::create(graph, VX_KERNEL_GAUSSIAN_PYRAMID, nextImg, nextPyr);
+
+                    Array prevPts = Array::create(context, VX_TYPE_KEYPOINT, npoints);
+                    Array estimatedPts = Array::create(context, VX_TYPE_KEYPOINT, npoints);
+                    Array nextPts = Array::create(context, VX_TYPE_KEYPOINT, npoints);
+
+                    std::vector<vx_keypoint_t> vxPrevPts(npoints), vxEstPts(npoints), vxNextPts(npoints);
+                    for (size_t i = 0; i < npoints; i++)
+                    {
+                        vx_keypoint_t &prevPt = vxPrevPts[i];
+                        vx_keypoint_t &estPt = vxEstPts[i];
+                        prevPt.x = prevPtsMat.at<Point2f>(i).x;
+                        prevPt.y = prevPtsMat.at<Point2f>(i).y;
+                        estPt.x = nextPtsMat.at<Point2f>(i).x;
+                        estPt.y = nextPtsMat.at<Point2f>(i).y;
+                        prevPt.tracking_status = estPt.tracking_status = vx_true_e;
+                    }
+                    prevPts.addItems(vxPrevPts);
+                    estimatedPts.addItems(vxEstPts);
+
+                    if ((criteria.type & TermCriteria::COUNT) == 0)
+                        criteria.maxCount = 30;
+                    else
+                        criteria.maxCount = std::min(std::max(criteria.maxCount, 0), 100);
+                    if ((criteria.type & TermCriteria::EPS) == 0)
+                        criteria.epsilon = 0.01;
+                    else
+                        criteria.epsilon = std::min(std::max(criteria.epsilon, 0.), 10.);
+                    criteria.epsilon *= criteria.epsilon;
+
+                    vx_enum termEnum = (criteria.type == TermCriteria::COUNT) ? VX_TERM_CRITERIA_ITERATIONS : (criteria.type == TermCriteria::EPS) ? VX_TERM_CRITERIA_EPSILON
+                                                                                                                                                   : VX_TERM_CRITERIA_BOTH;
+
+                    // minEigThreshold is fixed to 0.0001f
+                    ivx::Scalar termination = ivx::Scalar::create<VX_TYPE_ENUM>(context, termEnum);
+                    ivx::Scalar epsilon = ivx::Scalar::create<VX_TYPE_FLOAT32>(context, criteria.epsilon);
+                    ivx::Scalar numIterations = ivx::Scalar::create<VX_TYPE_UINT32>(context, criteria.maxCount);
+                    ivx::Scalar useInitial = ivx::Scalar::create<VX_TYPE_BOOL>(context, (vx_bool)(flags & OPTFLOW_USE_INITIAL_FLOW));
+                    // assume winSize is square
+                    ivx::Scalar windowSize = ivx::Scalar::create<VX_TYPE_SIZE>(context, (vx_size)winSize.width);
+
+                    ivx::Node::create(graph, VX_KERNEL_OPTICAL_FLOW_PYR_LK, prevPyr, nextPyr, prevPts, estimatedPts,
+                                      nextPts, termination, epsilon, numIterations, useInitial, windowSize);
+
+                    graph.verify();
+                    graph.process();
+
+                    nextPts.copyTo(vxNextPts);
+                    for (size_t i = 0; i < npoints; i++)
+                    {
+                        vx_keypoint_t kp = vxNextPts[i];
+                        nextPtsMat.at<Point2f>(i) = Point2f(kp.x, kp.y);
+                        statusMat.at<uchar>(i) = (bool)kp.tracking_status;
+                    }
+
+#ifdef VX_VERSION_1_1
+                    // we should take user memory back before release
+                    //(it's not done automatically according to standard)
+                    prevImg.swapHandle();
+                    nextImg.swapHandle();
+#endif
+                }
+                catch (const RuntimeError &e)
+                {
+                    VX_DbgThrow(e.what());
+                }
+                catch (const WrapperError &e)
+                {
+                    VX_DbgThrow(e.what());
+                }
+
+                return true;
             }
+#endif
+        };
 
-            Image prevImg = Image::createFromHandle(context, Image::matTypeToFormat(prevImgMat.type()),
-                                                    Image::createAddressing(prevImgMat), (void*)prevImgMat.data);
-            Image nextImg = Image::createFromHandle(context, Image::matTypeToFormat(nextImgMat.type()),
-                                                    Image::createAddressing(nextImgMat), (void*)nextImgMat.data);
+        void SparsePyrLKOpticalFlowImpl::calc(InputArray _prevImg, InputArray _nextImg,
+                                              InputArray _prevPts, InputOutputArray _nextPts,
+                                              OutputArray _status, OutputArray _err)
+        {
+            CV_INSTRUMENT_REGION();
 
-            Graph graph = Graph::create(context);
+            CV_OCL_RUN(ocl::isOpenCLActivated() &&
+                           (_prevImg.isUMat() || _nextImg.isUMat()) &&
+                           ocl::Image2D::isFormatSupported(CV_32F, 1, false),
+                       ocl_calcOpticalFlowPyrLK(_prevImg, _nextImg, _prevPts, _nextPts, _status, _err))
 
-            Pyramid prevPyr = Pyramid::createVirtual(graph, (vx_size)maxLevel+1, VX_SCALE_PYRAMID_HALF,
-                                                     prevImg.width(), prevImg.height(), prevImg.format());
-            Pyramid nextPyr = Pyramid::createVirtual(graph, (vx_size)maxLevel+1, VX_SCALE_PYRAMID_HALF,
-                                                     nextImg.width(), nextImg.height(), nextImg.format());
+            // Disabled due to bad accuracy
+            CV_OVX_RUN(false,
+                       openvx_pyrlk(_prevImg, _nextImg, _prevPts, _nextPts, _status, _err))
 
-            ivx::Node::create(graph, VX_KERNEL_GAUSSIAN_PYRAMID, prevImg, prevPyr);
-            ivx::Node::create(graph, VX_KERNEL_GAUSSIAN_PYRAMID, nextImg, nextPyr);
+            Mat prevPtsMat = _prevPts.getMat();
+            const int derivDepth = DataType<cv::detail::deriv_type>::depth;
 
-            Array prevPts = Array::create(context, VX_TYPE_KEYPOINT, npoints);
-            Array estimatedPts = Array::create(context, VX_TYPE_KEYPOINT, npoints);
-            Array nextPts = Array::create(context, VX_TYPE_KEYPOINT, npoints);
+            CV_Assert(maxLevel >= 0 && winSize.width > 2 && winSize.height > 2);
 
-            std::vector<vx_keypoint_t> vxPrevPts(npoints), vxEstPts(npoints), vxNextPts(npoints);
-            for(size_t i = 0; i < npoints; i++)
+            int level = 0, i, npoints;
+            CV_Assert((npoints = prevPtsMat.checkVector(2, CV_32F, true)) >= 0);
+
+            if (npoints == 0)
             {
-                vx_keypoint_t& prevPt = vxPrevPts[i]; vx_keypoint_t& estPt  = vxEstPts[i];
-                prevPt.x = prevPtsMat.at<Point2f>(i).x; prevPt.y = prevPtsMat.at<Point2f>(i).y;
-                 estPt.x = nextPtsMat.at<Point2f>(i).x;  estPt.y = nextPtsMat.at<Point2f>(i).y;
-                prevPt.tracking_status = estPt.tracking_status = vx_true_e;
+                _nextPts.release();
+                _status.release();
+                _err.release();
+                return;
             }
-            prevPts.addItems(vxPrevPts); estimatedPts.addItems(vxEstPts);
 
-            if( (criteria.type & TermCriteria::COUNT) == 0 )
+            if (!(flags & OPTFLOW_USE_INITIAL_FLOW))
+                _nextPts.create(prevPtsMat.size(), prevPtsMat.type(), -1, true);
+
+            Mat nextPtsMat = _nextPts.getMat();
+            CV_Assert(nextPtsMat.checkVector(2, CV_32F, true) == npoints);
+
+            const Point2f *prevPts = prevPtsMat.ptr<Point2f>();
+            Point2f *nextPts = nextPtsMat.ptr<Point2f>();
+
+            _status.create((int)npoints, 1, CV_8U, -1, true);
+            Mat statusMat = _status.getMat(), errMat;
+            CV_Assert(statusMat.isContinuous());
+            uchar *status = statusMat.ptr();
+            float *err = nullptr;
+
+            for (i = 0; i < npoints; i++)
+                status[i] = true;
+
+            if (_err.needed())
+            {
+                _err.create((int)npoints, 1, CV_32F, -1, true);
+                errMat = _err.getMat();
+                CV_Assert(errMat.isContinuous());
+                err = errMat.ptr<float>();
+            }
+
+            std::vector<Mat> prevPyr, nextPyr;
+            int levels1 = -1;
+            int lvlStep1 = 1;
+            int levels2 = -1;
+            int lvlStep2 = 1;
+
+            if (_prevImg.kind() == _InputArray::STD_VECTOR_MAT)
+            {
+                _prevImg.getMatVector(prevPyr);
+
+                levels1 = int(prevPyr.size()) - 1;
+                CV_Assert(levels1 >= 0);
+
+                if (levels1 % 2 == 1 && prevPyr[0].channels() * 2 == prevPyr[1].channels() && prevPyr[1].depth() == derivDepth)
+                {
+                    lvlStep1 = 2;
+                    levels1 /= 2;
+                }
+
+                // ensure that pyramid has required padding
+                if (levels1 > 0)
+                {
+                    Size fullSize;
+                    Point ofs;
+                    prevPyr[lvlStep1].locateROI(fullSize, ofs);
+                    CV_Assert(ofs.x >= winSize.width && ofs.y >= winSize.height && ofs.x + prevPyr[lvlStep1].cols + winSize.width <= fullSize.width && ofs.y + prevPyr[lvlStep1].rows + winSize.height <= fullSize.height);
+                }
+
+                if (levels1 < maxLevel)
+                    maxLevel = levels1;
+            }
+
+            if (_nextImg.kind() == _InputArray::STD_VECTOR_MAT)
+            {
+                _nextImg.getMatVector(nextPyr);
+
+                levels2 = int(nextPyr.size()) - 1;
+                CV_Assert(levels2 >= 0);
+
+                if (levels2 % 2 == 1 && nextPyr[0].channels() * 2 == nextPyr[1].channels() && nextPyr[1].depth() == derivDepth)
+                {
+                    lvlStep2 = 2;
+                    levels2 /= 2;
+                }
+
+                // ensure that pyramid has required padding
+                if (levels2 > 0)
+                {
+                    Size fullSize;
+                    Point ofs;
+                    nextPyr[lvlStep2].locateROI(fullSize, ofs);
+                    CV_Assert(ofs.x >= winSize.width && ofs.y >= winSize.height && ofs.x + nextPyr[lvlStep2].cols + winSize.width <= fullSize.width && ofs.y + nextPyr[lvlStep2].rows + winSize.height <= fullSize.height);
+                }
+
+                if (levels2 < maxLevel)
+                    maxLevel = levels2;
+            }
+
+            if (levels1 < 0)
+                maxLevel = buildOpticalFlowPyramid(_prevImg, prevPyr, winSize, maxLevel, false);
+
+            if (levels2 < 0)
+                maxLevel = buildOpticalFlowPyramid(_nextImg, nextPyr, winSize, maxLevel, false);
+
+            if ((criteria.type & TermCriteria::COUNT) == 0)
                 criteria.maxCount = 30;
             else
                 criteria.maxCount = std::min(std::max(criteria.maxCount, 0), 100);
-            if( (criteria.type & TermCriteria::EPS) == 0 )
+            if ((criteria.type & TermCriteria::EPS) == 0)
                 criteria.epsilon = 0.01;
             else
                 criteria.epsilon = std::min(std::max(criteria.epsilon, 0.), 10.);
             criteria.epsilon *= criteria.epsilon;
 
-            vx_enum termEnum = (criteria.type == TermCriteria::COUNT) ? VX_TERM_CRITERIA_ITERATIONS :
-                               (criteria.type == TermCriteria::EPS) ? VX_TERM_CRITERIA_EPSILON :
-                               VX_TERM_CRITERIA_BOTH;
+            // dI/dx ~ Ix, dI/dy ~ Iy
+            Mat derivIBuf;
+            if (lvlStep1 == 1)
+                derivIBuf.create(prevPyr[0].rows + winSize.height * 2, prevPyr[0].cols + winSize.width * 2, CV_MAKETYPE(derivDepth, prevPyr[0].channels() * 2));
 
-            //minEigThreshold is fixed to 0.0001f
-            ivx::Scalar termination = ivx::Scalar::create<VX_TYPE_ENUM>(context, termEnum);
-            ivx::Scalar epsilon = ivx::Scalar::create<VX_TYPE_FLOAT32>(context, criteria.epsilon);
-            ivx::Scalar numIterations = ivx::Scalar::create<VX_TYPE_UINT32>(context, criteria.maxCount);
-            ivx::Scalar useInitial = ivx::Scalar::create<VX_TYPE_BOOL>(context, (vx_bool)(flags & OPTFLOW_USE_INITIAL_FLOW));
-            //assume winSize is square
-            ivx::Scalar windowSize = ivx::Scalar::create<VX_TYPE_SIZE>(context, (vx_size)winSize.width);
-
-            ivx::Node::create(graph, VX_KERNEL_OPTICAL_FLOW_PYR_LK, prevPyr, nextPyr, prevPts, estimatedPts,
-                              nextPts, termination, epsilon, numIterations, useInitial, windowSize);
-
-            graph.verify();
-            graph.process();
-
-            nextPts.copyTo(vxNextPts);
-            for(size_t i = 0; i < npoints; i++)
+            for (level = maxLevel; level >= 0; level--)
             {
-                vx_keypoint_t kp = vxNextPts[i];
-                nextPtsMat.at<Point2f>(i) = Point2f(kp.x, kp.y);
-                statusMat.at<uchar>(i) = (bool)kp.tracking_status;
+                Mat derivI;
+                if (lvlStep1 == 1)
+                {
+                    Size imgSize = prevPyr[level * lvlStep1].size();
+                    Mat _derivI(imgSize.height + winSize.height * 2,
+                                imgSize.width + winSize.width * 2, derivIBuf.type(), derivIBuf.ptr());
+                    derivI = _derivI(Rect(winSize.width, winSize.height, imgSize.width, imgSize.height));
+                    calcScharrDeriv(prevPyr[level * lvlStep1], derivI);
+                    copyMakeBorder(derivI, _derivI, winSize.height, winSize.height, winSize.width, winSize.width, BORDER_CONSTANT | BORDER_ISOLATED);
+                }
+                else
+                    derivI = prevPyr[level * lvlStep1 + 1];
+
+                CV_Assert(prevPyr[level * lvlStep1].size() == nextPyr[level * lvlStep2].size());
+                CV_Assert(prevPyr[level * lvlStep1].type() == nextPyr[level * lvlStep2].type());
+
+                typedef cv::detail::LKTrackerInvoker LKTrackerInvoker;
+                parallel_for_(Range(0, npoints), LKTrackerInvoker(prevPyr[level * lvlStep1], derivI, nextPyr[level * lvlStep2], prevPts, nextPts, status, err, winSize, criteria, level, maxLevel, flags, (float)minEigThreshold), CV_DISABLE_LK_PARALLEL ? 1 : cv::getThreadNum());
             }
-
-#ifdef VX_VERSION_1_1
-        //we should take user memory back before release
-        //(it's not done automatically according to standard)
-        prevImg.swapHandle(); nextImg.swapHandle();
-#endif
-        }
-        catch (const RuntimeError & e)
-        {
-            VX_DbgThrow(e.what());
-        }
-        catch (const WrapperError & e)
-        {
-            VX_DbgThrow(e.what());
         }
 
-        return true;
-    }
-#endif
-};
-
-
-
-void SparsePyrLKOpticalFlowImpl::calc( InputArray _prevImg, InputArray _nextImg,
-                           InputArray _prevPts, InputOutputArray _nextPts,
-                           OutputArray _status, OutputArray _err)
-{
-    CV_INSTRUMENT_REGION();
-
-    CV_OCL_RUN(ocl::isOpenCLActivated() &&
-               (_prevImg.isUMat() || _nextImg.isUMat()) &&
-               ocl::Image2D::isFormatSupported(CV_32F, 1, false),
-               ocl_calcOpticalFlowPyrLK(_prevImg, _nextImg, _prevPts, _nextPts, _status, _err))
-
-    // Disabled due to bad accuracy
-    CV_OVX_RUN(false,
-               openvx_pyrlk(_prevImg, _nextImg, _prevPts, _nextPts, _status, _err))
-
-    Mat prevPtsMat = _prevPts.getMat();
-    const int derivDepth = DataType<cv::detail::deriv_type>::depth;
-
-    CV_Assert( maxLevel >= 0 && winSize.width > 2 && winSize.height > 2 );
-
-    int level=0, i, npoints;
-    CV_Assert( (npoints = prevPtsMat.checkVector(2, CV_32F, true)) >= 0 );
-
-    if( npoints == 0 )
-    {
-        _nextPts.release();
-        _status.release();
-        _err.release();
-        return;
-    }
-
-    if( !(flags & OPTFLOW_USE_INITIAL_FLOW) )
-        _nextPts.create(prevPtsMat.size(), prevPtsMat.type(), -1, true);
-
-    Mat nextPtsMat = _nextPts.getMat();
-    CV_Assert( nextPtsMat.checkVector(2, CV_32F, true) == npoints );
-
-    const Point2f* prevPts = prevPtsMat.ptr<Point2f>();
-    Point2f* nextPts = nextPtsMat.ptr<Point2f>();
-
-    _status.create((int)npoints, 1, CV_8U, -1, true);
-    Mat statusMat = _status.getMat(), errMat;
-    CV_Assert( statusMat.isContinuous() );
-    uchar* status = statusMat.ptr();
-    float* err = nullptr;
-
-    for( i = 0; i < npoints; i++ )
-        status[i] = true;
-
-    if( _err.needed() )
-    {
-        _err.create((int)npoints, 1, CV_32F, -1, true);
-        errMat = _err.getMat();
-        CV_Assert( errMat.isContinuous() );
-        err = errMat.ptr<float>();
-    }
-
-    std::vector<Mat> prevPyr, nextPyr;
-    int levels1 = -1;
-    int lvlStep1 = 1;
-    int levels2 = -1;
-    int lvlStep2 = 1;
-
-    if(_prevImg.kind() == _InputArray::STD_VECTOR_MAT)
-    {
-        _prevImg.getMatVector(prevPyr);
-
-        levels1 = int(prevPyr.size()) - 1;
-        CV_Assert(levels1 >= 0);
-
-        if (levels1 % 2 == 1 && prevPyr[0].channels() * 2 == prevPyr[1].channels() && prevPyr[1].depth() == derivDepth)
-        {
-            lvlStep1 = 2;
-            levels1 /= 2;
-        }
-
-        // ensure that pyramid has required padding
-        if(levels1 > 0)
-        {
-            Size fullSize;
-            Point ofs;
-            prevPyr[lvlStep1].locateROI(fullSize, ofs);
-            CV_Assert(ofs.x >= winSize.width && ofs.y >= winSize.height
-                && ofs.x + prevPyr[lvlStep1].cols + winSize.width <= fullSize.width
-                && ofs.y + prevPyr[lvlStep1].rows + winSize.height <= fullSize.height);
-        }
-
-        if(levels1 < maxLevel)
-            maxLevel = levels1;
-    }
-
-    if(_nextImg.kind() == _InputArray::STD_VECTOR_MAT)
-    {
-        _nextImg.getMatVector(nextPyr);
-
-        levels2 = int(nextPyr.size()) - 1;
-        CV_Assert(levels2 >= 0);
-
-        if (levels2 % 2 == 1 && nextPyr[0].channels() * 2 == nextPyr[1].channels() && nextPyr[1].depth() == derivDepth)
-        {
-            lvlStep2 = 2;
-            levels2 /= 2;
-        }
-
-        // ensure that pyramid has required padding
-        if(levels2 > 0)
-        {
-            Size fullSize;
-            Point ofs;
-            nextPyr[lvlStep2].locateROI(fullSize, ofs);
-            CV_Assert(ofs.x >= winSize.width && ofs.y >= winSize.height
-                && ofs.x + nextPyr[lvlStep2].cols + winSize.width <= fullSize.width
-                && ofs.y + nextPyr[lvlStep2].rows + winSize.height <= fullSize.height);
-        }
-
-        if(levels2 < maxLevel)
-            maxLevel = levels2;
-    }
-
-    if (levels1 < 0)
-        maxLevel = buildOpticalFlowPyramid(_prevImg, prevPyr, winSize, maxLevel, false);
-
-    if (levels2 < 0)
-        maxLevel = buildOpticalFlowPyramid(_nextImg, nextPyr, winSize, maxLevel, false);
-
-    if( (criteria.type & TermCriteria::COUNT) == 0 )
-        criteria.maxCount = 30;
-    else
-        criteria.maxCount = std::min(std::max(criteria.maxCount, 0), 100);
-    if( (criteria.type & TermCriteria::EPS) == 0 )
-        criteria.epsilon = 0.01;
-    else
-        criteria.epsilon = std::min(std::max(criteria.epsilon, 0.), 10.);
-    criteria.epsilon *= criteria.epsilon;
-
-    // dI/dx ~ Ix, dI/dy ~ Iy
-    Mat derivIBuf;
-    if(lvlStep1 == 1)
-        derivIBuf.create(prevPyr[0].rows + winSize.height*2, prevPyr[0].cols + winSize.width*2, CV_MAKETYPE(derivDepth, prevPyr[0].channels() * 2));
-
-    for( level = maxLevel; level >= 0; level-- )
-    {
-        Mat derivI;
-        if(lvlStep1 == 1)
-        {
-            Size imgSize = prevPyr[level * lvlStep1].size();
-            Mat _derivI( imgSize.height + winSize.height*2,
-                imgSize.width + winSize.width*2, derivIBuf.type(), derivIBuf.ptr() );
-            derivI = _derivI(Rect(winSize.width, winSize.height, imgSize.width, imgSize.height));
-            calcScharrDeriv(prevPyr[level * lvlStep1], derivI);
-            copyMakeBorder(derivI, _derivI, winSize.height, winSize.height, winSize.width, winSize.width, BORDER_CONSTANT|BORDER_ISOLATED);
-        }
-        else
-            derivI = prevPyr[level * lvlStep1 + 1];
-
-        CV_Assert(prevPyr[level * lvlStep1].size() == nextPyr[level * lvlStep2].size());
-        CV_Assert(prevPyr[level * lvlStep1].type() == nextPyr[level * lvlStep2].type());
-
-        typedef cv::detail::LKTrackerInvoker LKTrackerInvoker;
-        parallel_for_(Range(0, npoints), LKTrackerInvoker(prevPyr[level * lvlStep1], derivI,
-                                                          nextPyr[level * lvlStep2], prevPts, nextPts,
-                                                          status, err,
-                                                          winSize, criteria, level, maxLevel,
-                                                          flags, (float)minEigThreshold));
-    }
-}
-
-} // namespace
+    } // namespace
 } // namespace cv
-cv::Ptr<cv::SparsePyrLKOpticalFlow> cv::SparsePyrLKOpticalFlow::create(Size winSize, int maxLevel, TermCriteria crit, int flags, double minEigThreshold){
-    return makePtr<SparsePyrLKOpticalFlowImpl>(winSize,maxLevel,crit,flags,minEigThreshold);
-}
-void cv::calcOpticalFlowPyrLK( InputArray _prevImg, InputArray _nextImg,
-                               InputArray _prevPts, InputOutputArray _nextPts,
-                               OutputArray _status, OutputArray _err,
-                               Size winSize, int maxLevel,
-                               TermCriteria criteria,
-                               int flags, double minEigThreshold )
+cv::Ptr<cv::SparsePyrLKOpticalFlow> cv::SparsePyrLKOpticalFlow::create(Size winSize, int maxLevel, TermCriteria crit, int flags, double minEigThreshold)
 {
-    Ptr<cv::SparsePyrLKOpticalFlow> optflow = cv::SparsePyrLKOpticalFlow::create(winSize,maxLevel,criteria,flags,minEigThreshold);
-    optflow->calc(_prevImg,_nextImg,_prevPts,_nextPts,_status,_err);
+    return makePtr<SparsePyrLKOpticalFlowImpl>(winSize, maxLevel, crit, flags, minEigThreshold);
+}
+void cv::calcOpticalFlowPyrLK(InputArray _prevImg, InputArray _nextImg,
+                              InputArray _prevPts, InputOutputArray _nextPts,
+                              OutputArray _status, OutputArray _err,
+                              Size winSize, int maxLevel,
+                              TermCriteria criteria,
+                              int flags, double minEigThreshold)
+{
+    Ptr<cv::SparsePyrLKOpticalFlow> optflow = cv::SparsePyrLKOpticalFlow::create(winSize, maxLevel, criteria, flags, minEigThreshold);
+    optflow->calc(_prevImg, _nextImg, _prevPts, _nextPts, _status, _err);
 }
 
-cv::Mat cv::estimateRigidTransform( InputArray src1, InputArray src2, bool fullAffine )
+cv::Mat cv::estimateRigidTransform(InputArray src1, InputArray src2, bool fullAffine)
 {
     CV_INSTRUMENT_REGION();
 #ifndef HAVE_OPENCV_CALIB3D
-    CV_UNUSED(src1); CV_UNUSED(src2); CV_UNUSED(fullAffine);
+    CV_UNUSED(src1);
+    CV_UNUSED(src2);
+    CV_UNUSED(fullAffine);
     CV_Error(Error::StsError, "estimateRigidTransform requires calib3d module");
 #else
     Mat A = src1.getMat(), B = src2.getMat();
@@ -1458,40 +1488,40 @@ cv::Mat cv::estimateRigidTransform( InputArray src1, InputArray src2, bool fullA
     double scale = 1.;
     int i, j, k;
 
-    if( A.size() != B.size() )
-        CV_Error( Error::StsUnmatchedSizes, "Both input images must have the same size" );
+    if (A.size() != B.size())
+        CV_Error(Error::StsUnmatchedSizes, "Both input images must have the same size");
 
-    if( A.type() != B.type() )
-        CV_Error( Error::StsUnmatchedFormats, "Both input images must have the same data type" );
+    if (A.type() != B.type())
+        CV_Error(Error::StsUnmatchedFormats, "Both input images must have the same data type");
 
     int count = A.checkVector(2);
 
-    if( count > 0 )
+    if (count > 0)
     {
         // inputs are points
         A.reshape(2, count).convertTo(pA, CV_32F);
         B.reshape(2, count).convertTo(pB, CV_32F);
     }
-    else if( A.depth() == CV_8U )
+    else if (A.depth() == CV_8U)
     {
         // inputs are images
         int cn = A.channels();
-        CV_Assert( cn == 1 || cn == 3 || cn == 4 );
+        CV_Assert(cn == 1 || cn == 3 || cn == 4);
         Size sz0 = A.size();
         Size sz1(WIDTH, HEIGHT);
 
-        scale = std::max(1., std::max( (double)sz1.width/sz0.width, (double)sz1.height/sz0.height ));
+        scale = std::max(1., std::max((double)sz1.width / sz0.width, (double)sz1.height / sz0.height));
 
-        sz1.width = cvRound( sz0.width * scale );
-        sz1.height = cvRound( sz0.height * scale );
+        sz1.width = cvRound(sz0.width * scale);
+        sz1.height = cvRound(sz0.height * scale);
 
         bool equalSizes = sz1.width == sz0.width && sz1.height == sz0.height;
 
-        if( !equalSizes || cn != 1 )
+        if (!equalSizes || cn != 1)
         {
             Mat sA, sB;
 
-            if( cn != 1 )
+            if (cn != 1)
             {
                 Mat gray;
                 cvtColor(A, gray, COLOR_BGR2GRAY);
@@ -1510,29 +1540,29 @@ cv::Mat cv::estimateRigidTransform( InputArray src1, InputArray src2, bool fullA
         }
 
         int count_y = COUNT;
-        int count_x = cvRound((double)COUNT*sz1.width/sz1.height);
+        int count_x = cvRound((double)COUNT * sz1.width / sz1.height);
         count = count_x * count_y;
 
         pA.resize(count);
         pB.resize(count);
         status.resize(count);
 
-        for( i = 0, k = 0; i < count_y; i++ )
-            for( j = 0; j < count_x; j++, k++ )
+        for (i = 0, k = 0; i < count_y; i++)
+            for (j = 0; j < count_x; j++, k++)
             {
-                pA[k].x = (j+0.5f)*sz1.width/count_x;
-                pA[k].y = (i+0.5f)*sz1.height/count_y;
+                pA[k].x = (j + 0.5f) * sz1.width / count_x;
+                pA[k].y = (i + 0.5f) * sz1.height / count_y;
             }
 
         // find the corresponding points in B
         calcOpticalFlowPyrLK(A, B, pA, pB, status, noArray(), Size(21, 21), 3,
-                             TermCriteria(TermCriteria::MAX_ITER,40,0.1));
+                             TermCriteria(TermCriteria::MAX_ITER, 40, 0.1));
 
         // repack the remained points
-        for( i = 0, k = 0; i < count; i++ )
-            if( status[i] )
+        for (i = 0, k = 0; i < count; i++)
+            if (status[i])
             {
-                if( i > k )
+                if (i > k)
                 {
                     pA[k] = pA[i];
                     pB[k] = pB[i];
@@ -1544,7 +1574,7 @@ cv::Mat cv::estimateRigidTransform( InputArray src1, InputArray src2, bool fullA
         pB.resize(count);
     }
     else
-        CV_Error( Error::StsUnsupportedFormat, "Both input images must have either 8uC1 or 8uC3 type" );
+        CV_Error(Error::StsUnsupportedFormat, "Both input images must have either 8uC1 or 8uC3 type");
 
     if (fullAffine)
     {
