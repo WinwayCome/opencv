@@ -48,10 +48,6 @@
 #ifdef HAVE_OPENCV_CALIB3D
 #include "opencv2/calib3d.hpp"
 #endif
-#ifndef CV_DISABLE_LK_PARALLEL
-#define CV_DISABLE_LK_PARALLEL false
-#endif
-#if
 #include "opencv2/core/openvx/ovx_defs.hpp"
 #include "hal_replacement.hpp"
 
@@ -69,14 +65,14 @@ namespace
 
         // CALL_HAL(ScharrDeriv, cv_hal_ScharrDeriv, src.data, src.step, (short*)dst.data, dst.step, cols, rows, cn);
 
-        parallel_for_(Range(0, rows), cv::detail::ScharrDerivInvoker(src, dst), CV_DISABLE_LK_PARALLEL ? 1 : cv::getNumThreads());
+        parallel_for_(Range(0, rows), cv::detail::ScharrDerivInvoker(src, dst), cv::getNumThreads());
     }
 
 } // namespace
 
 void cv::detail::ScharrDerivInvoker::operator()(const Range &range) const
 {
-    CV_TRACE_FUNCTION();
+    CV_INSTRUMENT_REGION();
     using cv::detail::deriv_type;
     int rows = src.rows, cols = src.cols, cn = src.channels(), colsn = cols * cn;
 
@@ -213,7 +209,7 @@ typedef float itemtype;
 
 void cv::detail::LKTrackerInvoker::operator()(const Range &range) const
 {
-    CV_TRACE_FUNCTION();
+    CV_INSTRUMENT_REGION();
 
     const int W_BITS = 14, W_BITS1 = 14;
     const float FLT_SCALE = 1.f / (1 << 20);
@@ -1447,7 +1443,7 @@ namespace cv
                 CV_Assert(prevPyr[level * lvlStep1].type() == nextPyr[level * lvlStep2].type());
 
                 typedef cv::detail::LKTrackerInvoker LKTrackerInvoker;
-                parallel_for_(Range(0, npoints), LKTrackerInvoker(prevPyr[level * lvlStep1], derivI, nextPyr[level * lvlStep2], prevPts, nextPts, status, err, winSize, criteria, level, maxLevel, flags, (float)minEigThreshold), CV_DISABLE_LK_PARALLEL ? 1 : cv::getThreadNum());
+                parallel_for_(Range(0, npoints), LKTrackerInvoker(prevPyr[level * lvlStep1], derivI, nextPyr[level * lvlStep2], prevPts, nextPts, status, err, winSize, criteria, level, maxLevel, flags, (float)minEigThreshold), cv::getThreadNum());
             }
         }
 
